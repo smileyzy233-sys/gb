@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "standard-pipeline"
+version = "0.1.0"
+description = "Annual-report international-standard measurement pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pandas>=2.0",
+  "requests>=2.31,<3",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+local-model = [
+  "torch",
+  "transformers>=4.40",
+  "accelerate",
+  "sentencepiece",
+]
+vllm = [
+  "vllm",
+]
+quantization = [
+  "bitsandbytes",
+]
+dev = [
+  "pytest>=8",
+]
+
+[project.scripts]
+standard-pipeline = "standard_pipeline.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
