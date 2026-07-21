@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -255,10 +256,73 @@ PROTECTED_ANCHOR_TERMS = (
     "Zigbee",
     "FCC",
 )
-PROTECTED_ANCHOR_PATTERNS = tuple(
-    (term, re.compile(re.escape(term), re.IGNORECASE))
-    for term in PROTECTED_ANCHOR_TERMS
-)
+
+
+class ProtectedAnchorMatcher:
+    """Case-insensitive literal matcher with per-term ASCII word boundaries."""
+
+    __slots__ = ("_children", "_boundaries")
+
+    def __init__(self, terms: Iterable[str]) -> None:
+        self._children: list[dict[str, int]] = [{}]
+        self._boundaries: list[list[tuple[bool, bool]]] = [[]]
+        for term in terms:
+            folded = term.casefold()
+            node = 0
+            for char in folded:
+                next_node = self._children[node].get(char)
+                if next_node is None:
+                    next_node = len(self._children)
+                    self._children[node][char] = next_node
+                    self._children.append({})
+                    self._boundaries.append([])
+                node = next_node
+            self._boundaries[node].append(
+                (is_ascii_letter(term[0]), is_ascii_letter(term[-1]))
+            )
+
+    def search(self, text: str) -> bool:
+        folded = text.casefold()
+        text_len = len(folded)
+        root = self._children[0]
+        for start, first_char in enumerate(folded):
+            node = root.get(first_char)
+            if node is None:
+                continue
+            end = start + 1
+            while True:
+                for left_boundary, right_boundary in self._boundaries[node]:
+                    if left_boundary and start > 0 and is_ascii_letter(folded[start - 1]):
+                        continue
+                    if right_boundary and end < text_len and is_ascii_letter(folded[end]):
+                        continue
+                    return True
+                if end >= text_len:
+                    break
+                node = self._children[node].get(folded[end])
+                if node is None:
+                    break
+                end += 1
+        return False
+
+
+def build_protected_anchor_matcher(
+    additional_terms: Iterable[str] = (),
+) -> ProtectedAnchorMatcher:
+    """Build a matcher from built-in semantic anchors and configurable keywords."""
+    terms = {
+        unicodedata.normalize("NFKC", str(term)).strip()
+        for term in (*PROTECTED_ANCHOR_TERMS, *additional_terms)
+        if str(term).strip()
+    }
+    if not terms:
+        raise ValueError("At least one protected anchor term is required")
+    return ProtectedAnchorMatcher(
+        sorted(terms, key=lambda value: (-len(value), value.casefold()))
+    )
+
+
+PROTECTED_ANCHOR_MATCHER = build_protected_anchor_matcher()
 PURE_TABLE_VALUE_PATTERN = re.compile(
     r"^(?:[¥￥$€])?[-+]?"
     r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
@@ -441,17 +505,12 @@ def merge_dense_short_line_blocks(lines: list[str]) -> list[str]:
     return merged
 
 
-def has_protected_anchor(text: str) -> bool:
+def has_protected_anchor(
+    text: str,
+    protected_anchor_matcher: ProtectedAnchorMatcher = PROTECTED_ANCHOR_MATCHER,
+) -> bool:
     """Return True when text contains evidence that table cleanup must preserve."""
-    for term, pattern in PROTECTED_ANCHOR_PATTERNS:
-        for match in pattern.finditer(text):
-            start, end = match.span()
-            if is_ascii_letter(term[0]) and start > 0 and is_ascii_letter(text[start - 1]):
-                continue
-            if is_ascii_letter(term[-1]) and end < len(text) and is_ascii_letter(text[end]):
-                continue
-            return True
-    return False
+    return protected_anchor_matcher.search(text)
 
 
 def is_strong_table_noise_line(line: str) -> bool:
@@ -516,7 +575,11 @@ def find_table_like_blocks(lines: list[str]) -> list[tuple[int, int]]:
     return blocks
 
 
-def protected_table_context(lines: list[str], blocks: list[tuple[int, int]]) -> set[int]:
+def protected_table_context(
+    lines: list[str],
+    blocks: list[tuple[int, int]],
+    protected_anchor_matcher: ProtectedAnchorMatcher = PROTECTED_ANCHOR_MATCHER,
+) -> set[int]:
     protected: set[int] = set()
 
     def add_context(index: int) -> None:
@@ -529,7 +592,7 @@ def protected_table_context(lines: list[str], blocks: list[tuple[int, int]]) -> 
                 protected.add(neighbor)
 
     for index, line in enumerate(lines):
-        if has_protected_anchor(line):
+        if has_protected_anchor(line, protected_anchor_matcher):
             add_context(index)
 
     # PDF extraction can split one protected phrase over several tiny cells
@@ -537,7 +600,7 @@ def protected_table_context(lines: list[str], blocks: list[tuple[int, int]]) -> 
     # those anchors and their local context survive as well.
     for start, end in blocks:
         joined = "".join(re.sub(r"\s+", "", lines[index]) for index in range(start, end))
-        if not has_protected_anchor(joined):
+        if not has_protected_anchor(joined, protected_anchor_matcher):
             continue
         if end - start <= 12:
             protected.update(range(start, end))
@@ -545,7 +608,7 @@ def protected_table_context(lines: list[str], blocks: list[tuple[int, int]]) -> 
         for window_start in range(start, end):
             for window_end in range(window_start + 1, min(end, window_start + 6) + 1):
                 window = "".join(lines[index].strip() for index in range(window_start, window_end))
-                if has_protected_anchor(window):
+                if has_protected_anchor(window, protected_anchor_matcher):
                     for index in range(window_start, window_end):
                         add_context(index)
                     break
@@ -560,19 +623,25 @@ def calculate_table_noise_score(text: str) -> float:
     return round(sum(table_line_score(line) for line in lines) / len(lines), 4)
 
 
-def has_protected_anchor_in_text(text: str) -> bool:
+def has_protected_anchor_in_text(
+    text: str,
+    protected_anchor_matcher: ProtectedAnchorMatcher = PROTECTED_ANCHOR_MATCHER,
+) -> bool:
     """Detect direct anchors and anchors split across adjacent table cells."""
     normalized = normalize_unit_text(text)
     if not normalized:
         return False
     lines = normalized.split("\n")
-    if any(has_protected_anchor(line) for line in lines):
+    if any(has_protected_anchor(line, protected_anchor_matcher) for line in lines):
         return True
     blocks = find_table_like_blocks(lines)
-    return bool(protected_table_context(lines, blocks))
+    return bool(protected_table_context(lines, blocks, protected_anchor_matcher))
 
 
-def compress_table_noise(text: str) -> str:
+def compress_table_noise(
+    text: str,
+    protected_anchor_matcher: ProtectedAnchorMatcher = PROTECTED_ANCHOR_MATCHER,
+) -> str:
     """Remove line-level table noise while preserving anchored evidence and context."""
     normalized = normalize_unit_text(text)
     if not normalized:
@@ -584,7 +653,7 @@ def compress_table_noise(text: str) -> str:
         for start, end in blocks
         for index in range(start, end)
     }
-    protected = protected_table_context(lines, blocks)
+    protected = protected_table_context(lines, blocks, protected_anchor_matcher)
 
     filtered: list[str] = []
     for index, line in enumerate(lines):
@@ -603,7 +672,11 @@ def compress_table_noise(text: str) -> str:
     return result.strip()
 
 
-def clean_chapter_text_for_units(text: str, year: str | None = None) -> str:
+def clean_chapter_text_for_units(
+    text: str,
+    year: str | None = None,
+    protected_anchor_matcher: ProtectedAnchorMatcher = PROTECTED_ANCHOR_MATCHER,
+) -> str:
     text = unicodedata.normalize("NFKC", text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")]
@@ -612,7 +685,7 @@ def clean_chapter_text_for_units(text: str, year: str | None = None) -> str:
         for index, line in enumerate(lines)
         if not line or not should_drop_report_line(lines, index, year)
     ]
-    return compress_table_noise("\n".join(cleaned))
+    return compress_table_noise("\n".join(cleaned), protected_anchor_matcher)
 
 
 def match_chapter_title_at(lines: list[str], index: int) -> tuple[str, int] | None:
@@ -805,6 +878,7 @@ def run_build_text_units(
     unit_settings: TextUnitSettings,
     limit: int | None = None,
     input_files: list[Path] | None = None,
+    protected_anchor_terms: Iterable[str] = (),
 ) -> pd.DataFrame:
     if not input_dir.exists():
         raise FileNotFoundError(f"Input directory does not exist: {input_dir}")
@@ -820,6 +894,7 @@ def run_build_text_units(
     if limit is not None:
         files = files[:limit]
 
+    protected_anchor_matcher = build_protected_anchor_matcher(protected_anchor_terms)
     records: list[dict[str, object]] = []
     for file_path in tqdm(files, desc="build-text-units"):
         meta = parse_report_filename(file_path.name)
@@ -830,7 +905,11 @@ def run_build_text_units(
 
         unit_order = 1
         for chapter_title, chapter_text in chapter_blocks:
-            clean_text = clean_chapter_text_for_units(chapter_text, meta["year"])
+            clean_text = clean_chapter_text_for_units(
+                chapter_text,
+                meta["year"],
+                protected_anchor_matcher,
+            )
             for text in split_text_units(clean_text, unit_settings):
                 records.append(
                     {
@@ -870,6 +949,7 @@ def run_text_unit_noise_audit(
     output_csv: Path,
     limit: int | None = None,
     chunksize: int = 5000,
+    protected_anchor_terms: Iterable[str] = (),
 ) -> int:
     """Write a dry-run cleanup audit without modifying the input text-unit CSV."""
     if input_csv.resolve() == output_csv.resolve():
@@ -880,6 +960,7 @@ def run_text_unit_noise_audit(
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     temp_output = output_csv.with_name(f".{output_csv.name}.tmp")
     temp_output.unlink(missing_ok=True)
+    protected_anchor_matcher = build_protected_anchor_matcher(protected_anchor_terms)
     processed = 0
     wrote_header = False
 
@@ -901,7 +982,11 @@ def run_text_unit_noise_audit(
             for _, row in chunk.iterrows():
                 raw_text = "" if pd.isna(row["text"]) else str(row["text"])
                 year = None if pd.isna(row["year"]) else str(row["year"])
-                filtered_text = clean_chapter_text_for_units(raw_text, year)
+                filtered_text = clean_chapter_text_for_units(
+                    raw_text,
+                    year,
+                    protected_anchor_matcher,
+                )
                 raw_len = len(raw_text)
                 filtered_len = len(filtered_text)
                 removed_ratio = (raw_len - filtered_len) / raw_len if raw_len else 0.0
@@ -911,7 +996,10 @@ def run_text_unit_noise_audit(
                         "company_name": str(row["company_name"]),
                         "unit_order": row["unit_order"],
                         "table_noise_score": calculate_table_noise_score(raw_text),
-                        "has_protected_anchor": has_protected_anchor_in_text(raw_text),
+                        "has_protected_anchor": has_protected_anchor_in_text(
+                            raw_text,
+                            protected_anchor_matcher,
+                        ),
                         "raw_text_len": raw_len,
                         "filtered_text_len": filtered_len,
                         "removed_ratio": round(max(0.0, min(1.0, removed_ratio)), 4),

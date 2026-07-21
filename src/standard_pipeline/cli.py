@@ -40,6 +40,7 @@ from .main_regression import (
 )
 from .preprocess import (
     infer_report_dir,
+    load_keywords,
     run_preprocess,
     settings_from_config as preprocess_settings_from_config,
 )
@@ -158,6 +159,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_main_base_args(audit_units)
     audit_units.add_argument("--input", default=None, help="Existing text units CSV path.")
     audit_units.add_argument("--output", default=None, help="Dry-run audit CSV output path.")
+    audit_units.add_argument("--keywords", default=None, help="Keyword file used for table-evidence protection.")
 
     stage1 = subparsers.add_parser("stage1-screen", help="Run first-stage LLM relevance screening.")
     add_main_base_args(stage1)
@@ -554,6 +556,7 @@ def command_build_text_units(args: argparse.Namespace, config: PipelineConfig) -
     text_units_output = cli_path(config, args.output, paths.text_units_path)
     keyword_output = paths.keyword_features_path
     keywords = cli_path(config, args.keywords, config.path("keyword_file"))
+    protected_anchor_terms = load_keywords(keywords)
     preprocess_settings = preprocess_settings_from_config(config.section("preprocess"))
     unit_settings = text_unit_settings_from_config(config.section("main_regression"))
 
@@ -563,6 +566,7 @@ def command_build_text_units(args: argparse.Namespace, config: PipelineConfig) -
         preprocess_settings,
         unit_settings,
         limit=args.limit,
+        protected_anchor_terms=protected_anchor_terms,
     )
     df_keywords = run_keyword_features(text_units_output, keywords, keyword_output)
 
@@ -578,7 +582,13 @@ def command_audit_text_units(args: argparse.Namespace, config: PipelineConfig) -
     paths.ensure_dirs()
     input_csv = cli_path(config, args.input, paths.text_units_path)
     output_csv = cli_path(config, args.output, paths.text_unit_audit_path)
-    processed = run_text_unit_noise_audit(input_csv, output_csv, limit=args.limit)
+    keyword_file = cli_path(config, args.keywords, config.path("keyword_file"))
+    processed = run_text_unit_noise_audit(
+        input_csv,
+        output_csv,
+        limit=args.limit,
+        protected_anchor_terms=load_keywords(keyword_file),
+    )
     print(f"Audited {processed} text units without modifying {input_csv} -> {output_csv}")
     return output_csv
 
@@ -760,6 +770,7 @@ def command_main_regression(args: argparse.Namespace, config: PipelineConfig) ->
     preprocess_settings = preprocess_settings_from_config(config.section("preprocess"))
     unit_settings = text_unit_settings_from_config(config.section("main_regression"))
     keyword_file = config.path("keyword_file")
+    protected_anchor_terms = load_keywords(keyword_file)
     stage1_prompt_path = default_stage1_prompt_path(config)
     stage2_prompt_path = config.path("prompt_file")
     gb_mapping = config.path("gb_mapping_csv")
@@ -770,6 +781,7 @@ def command_main_regression(args: argparse.Namespace, config: PipelineConfig) ->
         preprocess_settings,
         unit_settings,
         limit=args.limit,
+        protected_anchor_terms=protected_anchor_terms,
     )
     run_keyword_features(paths.text_units_path, keyword_file, paths.keyword_features_path)
     stage1_raw_failure_log = paths.stage1_raw_failure_log_path(stage1_provider_value)

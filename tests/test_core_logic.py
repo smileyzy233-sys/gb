@@ -20,6 +20,7 @@ from standard_pipeline.gb_mapping import parse_standard_code, run_gb_mapping
 from standard_pipeline.llm import ApiClientConfig, OpenAICompatibleClient, api_config_from_dict
 from standard_pipeline.main_regression import (
     TextUnitSettings,
+    build_protected_anchor_matcher,
     compress_table_noise,
     call_stage1_with_retry,
     clean_chapter_text_for_units,
@@ -381,6 +382,28 @@ class MainRegressionTests(unittest.TestCase):
         self.assertEqual(result["stock_code"].tolist(), ["000002"])
         self.assertEqual(result["source_file"].tolist(), [second_report.name])
 
+    def test_build_text_units_uses_supplemental_protected_terms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            report_dir = tmp_path / "reports"
+            report_dir.mkdir()
+            report = report_dir / "000001_2024_A_年度报告.txt"
+            report.write_text(
+                "第一节 经营情况\n产品\nAX1\nJEDEC JESD47\n版本\n123456",
+                encoding="utf-8",
+            )
+
+            result = run_build_text_units(
+                report_dir,
+                tmp_path / "units.csv",
+                PreprocessSettings(min_chapter_chars=1, target_chapter_keywords=("经营情况",)),
+                TextUnitSettings(min_chars=1, max_chars=80),
+                protected_anchor_terms=["JEDEC"],
+            )
+
+        self.assertEqual(len(result), 1)
+        self.assertIn("JEDEC JESD47", result.loc[0, "text"])
+
     def test_chapter_filtering_selects_target_chapter(self):
         settings = PreprocessSettings(min_chapter_chars=1, target_chapter_keywords=("经营情况",))
         raw = "第一节 其他事项\n这里没有标准。\n第二节 经营情况\n公司通过 ISO 9001 认证。\n第三节 财务报告\n利润增长。"
@@ -498,6 +521,22 @@ class MainRegressionTests(unittest.TestCase):
 
     def test_split_table_anchor_is_detected(self):
         self.assertTrue(has_protected_anchor_in_text("项目\n认\n证\n编号\n12345"))
+
+    def test_table_compression_uses_supplemental_keyword_anchor(self):
+        text = "产品\nAX1\nJEDEC JESD47\n版本\n123456\n2024-12-31"
+        protected_anchor_matcher = build_protected_anchor_matcher(["JEDEC"])
+
+        self.assertNotIn("JEDEC", compress_table_noise(text))
+        filtered = compress_table_noise(text, protected_anchor_matcher)
+
+        self.assertIn("JEDEC JESD47", filtered)
+        self.assertIn("123456", filtered)
+
+    def test_supplemental_short_ascii_keyword_keeps_word_boundaries(self):
+        protected_anchor_matcher = build_protected_anchor_matcher(["UN"])
+
+        self.assertTrue(has_protected_anchor_in_text("项目\nUN\n12345", protected_anchor_matcher))
+        self.assertFalse(has_protected_anchor_in_text("项目\nJUNE\n12345", protected_anchor_matcher))
 
     def test_text_unit_noise_audit_is_dry_run_and_has_expected_schema(self):
         with tempfile.TemporaryDirectory() as tmp:

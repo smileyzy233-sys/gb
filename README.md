@@ -93,7 +93,7 @@ python scripts/run_pipeline.py audit-text-units --year 2021 `
   --base-dir "data/measurement/2021/main_regression_audit"
 ```
 
-该命令拒绝将审计结果写回输入路径，并输出页眉页码及表格行压缩前后的长度、删除比例、保护词命中和预览。正式重建时，章节标题仅按独立行识别；重复章节页眉不会新建章节边界，股票代码统一保留为六位字符串。
+该命令拒绝将审计结果写回输入路径，并输出页眉页码及表格行压缩前后的长度、删除比例、保护词命中和预览。表格保护词由内置的标准、认证、许可等语义锚点与 `paths.keyword_file`（默认 `configs/standard_keywords.txt`）合并生成；`build-text-units` 和 `audit-text-units` 均可用 `--keywords` 临时覆盖关键词文件。正式重建时，章节标题仅按独立行识别；重复章节页眉不会新建章节边界，股票代码统一保留为六位字符串。
 
 只抽样构建文本单元（不运行关键词特征和 LLM）：
 

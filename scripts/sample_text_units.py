@@ -18,6 +18,7 @@ from standard_pipeline.main_regression import (
 )
 from standard_pipeline.preprocess import (
     infer_report_dir,
+    load_keywords,
     normalize_stock_code,
     parse_report_filename,
     settings_from_config as preprocess_settings_from_config,
@@ -108,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
     stock_codes = parse_stock_codes(args.stock_codes)
     preprocess_settings = preprocess_settings_from_config(config.section("preprocess"))
     unit_settings = text_unit_settings_from_config(config.section("main_regression"))
+    protected_anchor_terms = load_keywords(config.path("keyword_file"))
 
     for raw_year in args.years:
         year = str(raw_year).strip()
@@ -128,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
             preprocess_settings,
             unit_settings,
             input_files=selected,
+            protected_anchor_terms=protected_anchor_terms,
         )
         selected_names = ", ".join(path.name for path in selected)
         print(f"[{year}] reports={len(selected)} -> {output_csv}")
