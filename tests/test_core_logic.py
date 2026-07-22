@@ -16,7 +16,13 @@ from standard_pipeline import cli as cli_module
 from standard_pipeline.comparison import run_collect_firm_year_outputs, run_compare_dummy_consistency
 from standard_pipeline.config import PipelineConfig
 from standard_pipeline.extract import ExtractSettings, process_text_unit_row
-from standard_pipeline.gb_mapping import parse_standard_code, run_gb_mapping
+from standard_pipeline.gb_mapping import (
+    build_mapping_lookup,
+    find_mapping,
+    map_row,
+    parse_standard_code,
+    run_gb_mapping,
+)
 from standard_pipeline.llm import ApiClientConfig, OpenAICompatibleClient, api_config_from_dict
 from standard_pipeline.main_regression import (
     TextUnitSettings,
@@ -69,6 +75,102 @@ class GbMappingTests(unittest.TestCase):
     def test_parse_standard_code(self):
         self.assertEqual(parse_standard_code("GB/T 19001-2016"), ("GB/T19001", "2016"))
         self.assertEqual(parse_standard_code("GB 3836.1-2021"), ("GB3836.1", "2021"))
+
+    def test_missing_entity_year_uses_version_active_at_report_cutoff(self):
+        mapping = pd.DataFrame(
+            [
+                {
+                    "标准号": "GB/T 13471-2025",
+                    "国际标准编号": "ISO/TS 50044:2019",
+                    "采标类型": "非等效采用",
+                    "生效日期": "2026-05-01",
+                    "失效日期": None,
+                    "当前状态": "即将实施",
+                    "时间数据质量": "NOT_EFFECTIVE_AT_SNAPSHOT",
+                },
+                {
+                    "标准号": "GB/T 13471-2008",
+                    "国际标准编号": None,
+                    "采标类型": None,
+                    "生效日期": "2009-05-01",
+                    "失效日期": "2026-05-01",
+                    "当前状态": "现行",
+                    "时间数据质量": "OK",
+                },
+            ]
+        )
+        lookup = build_mapping_lookup(mapping)
+
+        historical = find_mapping("GB/T 13471", lookup, "2020")
+        future = find_mapping("GB/T 13471", lookup, "2026")
+        mapped = map_row(
+            pd.Series({"entity": "GB/T 13471", "type": "TYPE_B", "status": "ADOPTED", "year": "2020"}),
+            lookup,
+        )
+
+        self.assertIsNotNone(historical)
+        self.assertEqual(historical.original_code, "GB/T 13471-2008")
+        self.assertIsNotNone(future)
+        self.assertEqual(future.original_code, "GB/T 13471-2025")
+        self.assertEqual(mapped[2], 0)
+
+    def test_explicit_version_never_falls_back_to_another_year(self):
+        mapping = pd.DataFrame(
+            [
+                {"标准号": "GB/T 19001-2016", "国际标准编号": "ISO 9001:2015", "采标类型": "等同采用"},
+                {"标准号": "GB/T 19001-2024", "国际标准编号": "ISO 9001:2024", "采标类型": "等同采用"},
+            ]
+        )
+        lookup = build_mapping_lookup(mapping)
+
+        self.assertIsNone(find_mapping("GB/T 19001-2020", lookup, "2020"))
+
+    def test_explicit_version_after_report_cutoff_is_rejected(self):
+        mapping = pd.DataFrame(
+            [
+                {
+                    "标准号": "GB/T 17650.2-2021",
+                    "国际标准编号": "IEC 60754-2:2019",
+                    "采标类型": "等同采用",
+                    "生效日期": "2021-11-01",
+                    "当前状态": "现行",
+                    "时间数据质量": "OK",
+                }
+            ]
+        )
+        lookup = build_mapping_lookup(mapping)
+
+        self.assertIsNone(find_mapping("GB/T 17650.2-2021", lookup, "2020"))
+        self.assertIsNotNone(find_mapping("GB/T 17650.2-2021", lookup, "2021"))
+
+    def test_deprecated_version_with_known_expiry_is_used_historically(self):
+        mapping = pd.DataFrame(
+            [
+                {
+                    "标准号": "GB/T 17650.2-2021",
+                    "国际标准编号": "IEC 60754-2:2019",
+                    "采标类型": "等同采用",
+                    "生效日期": "2021-11-01",
+                    "当前状态": "现行",
+                    "时间数据质量": "OK",
+                },
+                {
+                    "标准号": "GB/T 17650.2-1998",
+                    "国际标准编号": "IEC 60754-2:1991",
+                    "采标类型": "等同采用",
+                    "生效日期": "1999-10-01",
+                    "失效日期": "2021-11-01",
+                    "当前状态": "废止",
+                    "时间数据质量": "OK",
+                },
+            ]
+        )
+        lookup = build_mapping_lookup(mapping)
+
+        historical = find_mapping("GB/T 17650.2", lookup, "2020")
+
+        self.assertIsNotNone(historical)
+        self.assertEqual(historical.international_standard, "IEC 60754-2:1991")
 
     def test_run_gb_mapping(self):
         with tempfile.TemporaryDirectory() as tmp:
