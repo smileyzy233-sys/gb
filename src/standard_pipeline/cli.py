@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-import re
 import sys
 
 from .config import PipelineConfig, load_config, resolve_path
@@ -15,9 +14,7 @@ from .comparison import (
 )
 from .extract import (
     ExtractSettings,
-    run_extraction,
     run_text_unit_extraction,
-    settings_from_config as extract_settings_from_config,
 )
 from .gb_mapping import run_gb_mapping
 from .llm import (
@@ -41,10 +38,10 @@ from .main_regression import (
 from .preprocess import (
     infer_report_dir,
     load_keywords,
-    run_preprocess,
     settings_from_config as preprocess_settings_from_config,
 )
 from .robustness import (
+    RobustnessPaths,
     default_robustness_paths,
     run_prepare_full_units,
     run_prepare_keyword_units,
@@ -98,7 +95,11 @@ def add_robustness_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--main-base-dir", default=None, help="Main-regression directory to reuse as source.")
     parser.add_argument("--limit", type=int, default=None, help="Limit prepared text units for smoke tests.")
     add_llm_args(parser)
-    parser.add_argument("--no-resume", action="store_true", help="Ignore existing method stage2 output and log.")
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Clear this method's Stage1/Stage2 checkpoints before running.",
+    )
     parser.add_argument(
         "--no-reuse-main-stage2",
         action="store_true",
@@ -110,41 +111,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="standard-pipeline")
     add_common_args(parser)
     subparsers = parser.add_subparsers(dest="command", required=True)
-
-    preprocess = subparsers.add_parser("preprocess", help="Extract relevant annual-report snippets.")
-    preprocess.add_argument("--year", required=False, help="Report year, for example 2024.")
-    preprocess.add_argument("--input-dir", default=None, help="Annual report txt directory.")
-    preprocess.add_argument("--output", default=None, help="Preprocessed CSV output path.")
-    preprocess.add_argument("--keywords", default=None, help="Keyword file path.")
-    preprocess.add_argument("--limit", type=int, default=None, help="Limit files for smoke tests.")
-
-    extract = subparsers.add_parser("extract", help="Extract standard entities with an LLM.")
-    extract.add_argument("--input", required=True, help="Preprocessed CSV path.")
-    extract.add_argument("--output", default=None, help="Extraction CSV output path.")
-    extract.add_argument("--log", default=None, help="Resume log path.")
-    extract.add_argument("--prompt", default=None, help="System prompt text file.")
-    extract.add_argument("--provider", choices=["api", "local"], default=None, help="LLM provider.")
-    extract.add_argument("--api-key", default=None, help="API key. Prefer environment variables.")
-    extract.add_argument("--model-path", default=None, help="Local Hugging Face model path.")
-    extract.add_argument("--workers", type=int, default=None, help="Concurrent API workers. Local mode is forced to 1.")
-    extract.add_argument("--batch-size", type=int, default=None, help="Rows to flush per batch.")
-    extract.add_argument("--limit", type=int, default=None, help="Limit rows for smoke tests.")
-    extract.add_argument("--no-resume", action="store_true", help="Ignore existing processed-task log.")
-
-    map_gb = subparsers.add_parser("map-gb", help="Map TYPE_B GB standards to international standards.")
-    map_gb.add_argument("--input", required=True, help="Extraction CSV path.")
-    map_gb.add_argument("--gb-dict", default=None, help="GB mapping CSV path.")
-    map_gb.add_argument("--output", default=None, help="Mapped CSV output path.")
-
-    run_all = subparsers.add_parser("run-all", help="Run preprocess, extract, and GB mapping.")
-    run_all.add_argument("--year", required=True, help="Report year, for example 2024.")
-    run_all.add_argument("--input-dir", default=None, help="Annual report txt directory.")
-    run_all.add_argument("--provider", choices=["api", "local"], default=None, help="LLM provider.")
-    run_all.add_argument("--api-key", default=None, help="API key. Prefer environment variables.")
-    run_all.add_argument("--model-path", default=None, help="Local Hugging Face model path.")
-    run_all.add_argument("--workers", type=int, default=None, help="Concurrent API workers.")
-    run_all.add_argument("--limit", type=int, default=None, help="Limit files/rows for smoke tests.")
-    run_all.add_argument("--no-resume", action="store_true", help="Ignore existing processed-task log.")
 
     build_units = subparsers.add_parser("build-text-units", help="Build text_unit rows and keyword features.")
     add_main_base_args(build_units)
@@ -225,29 +191,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     compare.add_argument("--smoke", action="store_true", help="Read and write under data/measurement_smoke.")
 
     return parser.parse_args(argv)
-
-
-def infer_year_from_path(path: Path) -> str:
-    match = re.search(r"(20\d{2}|19\d{2})", path.stem)
-    if not match:
-        raise ValueError(f"Cannot infer year from path: {path}")
-    return match.group(1)
-
-
-def default_preprocessed_path(config: PipelineConfig, year: str) -> Path:
-    return config.path("preprocessed_dir") / f"yuchuli_{year}.csv"
-
-
-def default_extraction_path(config: PipelineConfig, year: str) -> Path:
-    return config.path("prediction_dir") / f"final_{year}.csv"
-
-
-def default_log_path(config: PipelineConfig, year: str, provider: str) -> Path:
-    return config.path("log_dir") / f"processed_tasks_{year}_{provider}.log"
-
-
-def default_mapped_path(input_csv: Path) -> Path:
-    return input_csv.with_name(f"{input_csv.stem}_mapped.csv")
 
 
 def default_stage1_prompt_path(config: PipelineConfig) -> Path:
@@ -396,15 +339,8 @@ def write_main_manifest(
         model_stage1=model_stage1,
         model_stage2=model_stage2,
         stage1_raw_failure_log_path=stage1_raw_failure_log,
+        stage2_failure_queue_path=paths.stage2_failure_queue_path(resolved_stage2_provider),
     )
-
-
-def build_client(config: PipelineConfig, provider: str, api_key: str | None = None, model_path: str | None = None):
-    if provider == "api":
-        return OpenAICompatibleClient(api_config_from_dict(config.section("extract", "api"), api_key=api_key))
-    if provider == "local":
-        return LocalModelClient(local_config_from_dict(config.section("extract", "local"), model_path=model_path))
-    raise ValueError(f"Provider {provider} does not use ChatClient. Use the dedicated runner.")
 
 
 def stage_provider(config: PipelineConfig, stage_name: str, fallback_provider: str | None = None) -> str:
@@ -454,99 +390,8 @@ def stage_extract_settings(
     )
 
 
-def extract_settings(config: PipelineConfig, workers: int | None, batch_size: int | None, provider: str) -> ExtractSettings:
-    settings = extract_settings_from_config(config.section("extract"))
-    resolved_workers = workers or settings.workers
-    return ExtractSettings(
-        workers=resolved_workers,
-        batch_size=batch_size or settings.batch_size,
-        max_retries=settings.max_retries,
-        retry_min_seconds=settings.retry_min_seconds,
-        retry_max_seconds=settings.retry_max_seconds,
-    )
-
-
 def read_prompt(path: Path) -> str:
     return path.read_text(encoding="utf-8")
-
-
-def command_preprocess(args: argparse.Namespace, config: PipelineConfig) -> Path:
-    if args.input_dir:
-        input_dir = resolve_path(config.project_root, args.input_dir)
-    else:
-        if not args.year:
-            raise ValueError("--year is required when --input-dir is not provided")
-        input_dir = infer_report_dir(config.path("annual_reports_dir"), args.year)
-    year = args.year or infer_year_from_path(input_dir)
-    output = cli_path(config, args.output, default_preprocessed_path(config, year))
-    keywords = cli_path(config, args.keywords, config.path("keyword_file"))
-    settings = preprocess_settings_from_config(config.section("preprocess"))
-    df = run_preprocess(input_dir, output, keywords, settings, limit=args.limit)
-    print(f"Preprocessed {len(df)} rows -> {output}")
-    return output
-
-
-def command_extract(args: argparse.Namespace, config: PipelineConfig) -> Path:
-    input_csv = resolve_path(config.project_root, args.input)
-    year = infer_year_from_path(input_csv)
-    provider = args.provider or config.section("extract").get("provider", "api")
-    output = cli_path(config, args.output, default_extraction_path(config, year))
-    log_file = cli_path(config, args.log, default_log_path(config, year, provider))
-    prompt = read_prompt(cli_path(config, args.prompt, config.path("prompt_file")))
-    client = build_client(config, provider, api_key=args.api_key, model_path=args.model_path)
-    settings = extract_settings(config, args.workers, args.batch_size, provider)
-    df = run_extraction(
-        input_csv,
-        output,
-        log_file,
-        client,
-        prompt,
-        settings,
-        resume=not args.no_resume,
-        limit=args.limit,
-    )
-    print(f"Extracted {len(df)} rows -> {output}")
-    return output
-
-
-def command_map_gb(args: argparse.Namespace, config: PipelineConfig) -> Path:
-    input_csv = resolve_path(config.project_root, args.input)
-    gb_dict = cli_path(config, args.gb_dict, config.path("gb_mapping_csv"))
-    output = cli_path(config, args.output, default_mapped_path(input_csv))
-    df = run_gb_mapping(input_csv, gb_dict, output)
-    print(f"Mapped {len(df)} rows -> {output}")
-    return output
-
-
-def command_run_all(args: argparse.Namespace, config: PipelineConfig) -> None:
-    preprocess_args = argparse.Namespace(
-        year=args.year,
-        input_dir=args.input_dir,
-        output=None,
-        keywords=None,
-        limit=args.limit,
-    )
-    preprocessed_csv = command_preprocess(preprocess_args, config)
-
-    provider = args.provider or config.section("extract").get("provider", "api")
-    extraction_csv = default_extraction_path(config, args.year)
-    extract_args = argparse.Namespace(
-        input=str(preprocessed_csv),
-        output=str(extraction_csv),
-        log=None,
-        prompt=None,
-        provider=provider,
-        api_key=args.api_key,
-        model_path=args.model_path,
-        workers=args.workers,
-        batch_size=None,
-        limit=args.limit,
-        no_resume=args.no_resume,
-    )
-    final_csv = command_extract(extract_args, config)
-
-    map_args = argparse.Namespace(input=str(final_csv), gb_dict=None, output=None)
-    command_map_gb(map_args, config)
 
 
 def command_build_text_units(args: argparse.Namespace, config: PipelineConfig) -> Path:
@@ -638,6 +483,7 @@ def command_stage1_screen(args: argparse.Namespace, config: PipelineConfig) -> P
             limit=args.limit,
             keyword_features_csv=keyword_features if keyword_features.exists() else None,
             raw_failure_log=raw_failure_log,
+            resume=not args.no_resume,
         )
     write_main_manifest(
         config,
@@ -693,6 +539,7 @@ def command_stage2_extract(args: argparse.Namespace, config: PipelineConfig) -> 
             stage2_input,
             output,
             log_file,
+            paths.stage2_failure_queue_path(provider),
             prompt,
             batch_config,
             resume=not args.no_resume,
@@ -711,11 +558,13 @@ def command_stage2_extract(args: argparse.Namespace, config: PipelineConfig) -> 
             stage2_input,
             output,
             log_file,
+            paths.stage2_failure_queue_path(provider),
             client,
             prompt,
             settings,
             resume=not args.no_resume,
             limit=args.limit,
+            provider=provider,
         )
     write_main_manifest(
         config,
@@ -817,6 +666,7 @@ def command_main_regression(args: argparse.Namespace, config: PipelineConfig) ->
             stage1_settings,
             keyword_features_csv=paths.keyword_features_path,
             raw_failure_log=stage1_raw_failure_log,
+            resume=not args.no_resume,
         )
     stage2_input = run_route_main(
         paths.text_units_path,
@@ -834,6 +684,7 @@ def command_main_regression(args: argparse.Namespace, config: PipelineConfig) ->
             paths.stage2_input_path,
             paths.stage2_result_path,
             paths.stage2_log_path(stage2_provider_value),
+            paths.stage2_failure_queue_path(stage2_provider_value),
             stage2_prompt,
             stage2_batch_config,
             resume=not args.no_resume,
@@ -851,10 +702,12 @@ def command_main_regression(args: argparse.Namespace, config: PipelineConfig) ->
             paths.stage2_input_path,
             paths.stage2_result_path,
             paths.stage2_log_path(stage2_provider_value),
+            paths.stage2_failure_queue_path(stage2_provider_value),
             stage2_client,
             stage2_prompt,
             stage2_settings,
             resume=not args.no_resume,
+            provider=stage2_provider_value,
         )
     run_gb_mapping(paths.stage2_result_path, gb_mapping, paths.mapped_result_path)
     final = run_aggregate_main(paths.text_units_path, paths.mapped_result_path, paths.final_output_path)
@@ -877,13 +730,28 @@ def command_main_regression(args: argparse.Namespace, config: PipelineConfig) ->
     return paths.final_output_path
 
 
-def remove_stage2_resume_files(output_csv: Path, log_file: Path) -> None:
-    for path in (output_csv, log_file):
-        if path.exists():
-            path.unlink()
+def remove_robustness_resume_files(
+    paths: RobustnessPaths,
+    stage2_provider: str,
+    stage1_provider: str | None = None,
+) -> None:
+    paths.stage2_result_path.unlink(missing_ok=True)
+    providers = {stage2_provider, "api", "local", "vllm_batch"}
+    for provider in providers:
+        paths.stage2_log_path(provider).unlink(missing_ok=True)
+        paths.stage2_failure_queue_path(provider).unlink(missing_ok=True)
+    if stage1_provider is not None:
+        paths.stage1_relevance_path.unlink(missing_ok=True)
+        for provider in {stage1_provider, "api", "local", "vllm_batch"}:
+            paths.stage1_raw_failure_log_path(provider).unlink(missing_ok=True)
 
 
-def prepare_robustness_units(method: str, paths, main: MainRegressionPaths, limit: int | None):
+def prepare_robustness_units(
+    method: str,
+    paths: RobustnessPaths,
+    main: MainRegressionPaths,
+    limit: int | None,
+):
     if method == "robustness_keyword":
         return run_prepare_keyword_units(
             main.text_units_path,
@@ -894,7 +762,7 @@ def prepare_robustness_units(method: str, paths, main: MainRegressionPaths, limi
     if method == "robustness_llm_only":
         return run_prepare_llm_units(
             main.text_units_path,
-            main.stage1_relevance_path,
+            paths.stage1_relevance_path,
             paths.units_path,
             limit=limit,
         )
@@ -905,13 +773,14 @@ def command_robustness(args: argparse.Namespace, config: PipelineConfig, method:
     paths = robustness_paths(config, args, method)
     main = robustness_source_main_paths(config, args)
     paths.ensure_dirs()
+    stage1_provider_value = stage_provider(config, "stage1", args.provider)
     provider = stage_provider(config, "stage2", args.provider)
     stage2_prompt_path = config.path("prompt_file")
     stage1_prompt_path = default_stage1_prompt_path(config)
     gb_mapping = config.path("gb_mapping_csv")
     stage1_model_label = provider_model_label(
         config,
-        stage_provider(config, "stage1", args.provider),
+        stage1_provider_value,
         model_path=args.model_path,
         stage_name="stage1",
     )
@@ -922,10 +791,59 @@ def command_robustness(args: argparse.Namespace, config: PipelineConfig, method:
         stage_name="stage2",
     )
 
-    units = prepare_robustness_units(method, paths, main, args.limit)
     log_file = paths.stage2_log_path(provider)
+    failure_queue = paths.stage2_failure_queue_path(provider)
     if args.no_resume:
-        remove_stage2_resume_files(paths.stage2_result_path, log_file)
+        remove_robustness_resume_files(
+            paths,
+            provider,
+            stage1_provider_value if method == "robustness_llm_only" else None,
+        )
+    failure_queue.parent.mkdir(parents=True, exist_ok=True)
+    failure_queue.touch(exist_ok=True)
+
+    if method == "robustness_llm_only":
+        stage1_prompt = read_prompt(stage1_prompt_path)
+        stage1_raw_failure_log = paths.stage1_raw_failure_log_path(stage1_provider_value)
+        if stage1_provider_value == "vllm_batch":
+            stage1_batch_config = vllm_batch_config_from_dict(
+                config.section("stage1", "vllm_batch"),
+                model_path=args.model_path,
+            )
+            run_stage1_screening_vllm_batch(
+                main.text_units_path,
+                paths.stage1_relevance_path,
+                stage1_prompt,
+                stage1_batch_config,
+                limit=args.limit,
+                keyword_features_csv=None,
+                raw_failure_log=stage1_raw_failure_log,
+                resume=not args.no_resume,
+            )
+        else:
+            stage1_client = build_stage_client(
+                config,
+                "stage1",
+                stage1_provider_value,
+                api_key=args.api_key,
+                model_path=args.model_path,
+            )
+            stage1_settings = stage_extract_settings(config, "stage1", args.workers, args.batch_size)
+            run_stage1_screening(
+                main.text_units_path,
+                paths.stage1_relevance_path,
+                stage1_client,
+                stage1_prompt,
+                stage1_settings,
+                limit=args.limit,
+                keyword_features_csv=None,
+                raw_failure_log=stage1_raw_failure_log,
+                resume=not args.no_resume,
+            )
+    else:
+        stage1_raw_failure_log = None
+
+    units = prepare_robustness_units(method, paths, main, args.limit)
 
     seed_report = None
     if not args.no_reuse_main_stage2:
@@ -948,6 +866,7 @@ def command_robustness(args: argparse.Namespace, config: PipelineConfig, method:
                 paths.units_path,
                 paths.stage2_result_path,
                 log_file,
+                failure_queue,
                 stage2_prompt,
                 batch_config,
                 resume=True,
@@ -965,10 +884,12 @@ def command_robustness(args: argparse.Namespace, config: PipelineConfig, method:
                 paths.units_path,
                 paths.stage2_result_path,
                 log_file,
+                failure_queue,
                 client,
                 stage2_prompt,
                 settings,
                 resume=True,
+                provider=provider,
             )
 
     run_gb_mapping(paths.stage2_result_path, gb_mapping, paths.mapped_result_path)
@@ -977,13 +898,15 @@ def command_robustness(args: argparse.Namespace, config: PipelineConfig, method:
         paths,
         source_text_units_path=main.text_units_path,
         source_keyword_features_path=main.keyword_features_path if method == "robustness_keyword" else None,
-        source_stage1_relevance_path=main.stage1_relevance_path if method == "robustness_llm_only" else None,
+        source_stage1_relevance_path=paths.stage1_relevance_path if method == "robustness_llm_only" else None,
         source_stage2_result_path=main.stage2_result_path,
         prompt_stage1_path=stage1_prompt_path if method == "robustness_llm_only" else None,
         prompt_stage2_path=stage2_prompt_path,
         gb_mapping_path=gb_mapping,
         model_stage1=stage1_model_label if method == "robustness_llm_only" else None,
         model_stage2=stage2_model_label,
+        stage1_raw_failure_log_path=stage1_raw_failure_log,
+        stage2_failure_queue_path=failure_queue,
     )
 
     if seed_report is not None:
@@ -1030,15 +953,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     config = load_config(args.config, args.project_root)
     try:
-        if args.command == "preprocess":
-            command_preprocess(args, config)
-        elif args.command == "extract":
-            command_extract(args, config)
-        elif args.command == "map-gb":
-            command_map_gb(args, config)
-        elif args.command == "run-all":
-            command_run_all(args, config)
-        elif args.command == "build-text-units":
+        if args.command == "build-text-units":
             command_build_text_units(args, config)
         elif args.command == "audit-text-units":
             command_audit_text_units(args, config)

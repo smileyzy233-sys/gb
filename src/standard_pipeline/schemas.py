@@ -5,7 +5,6 @@ from collections.abc import Iterable
 import pandas as pd
 
 
-PREPROCESSED_COLUMNS = ["stock_code", "company_name", "year", "full_text"]
 EXTRACTION_COLUMNS = ["stock_code", "company_name", "year", "entity", "type", "status", "evidence"]
 MAPPED_COLUMNS = EXTRACTION_COLUMNS + ["国际标准", "采标情况", "output"]
 

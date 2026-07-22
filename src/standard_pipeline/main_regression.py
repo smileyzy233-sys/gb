@@ -31,8 +31,8 @@ from .schemas import (
     KEYWORD_FEATURE_COLUMNS,
     MAIN_FINAL_COLUMNS,
     MAIN_MAPPED_COLUMNS,
+    ROUTE_AUDIT_COLUMNS,
     STAGE1_RELEVANCE_COLUMNS,
-    STAGE2_INPUT_COLUMNS,
     TEXT_UNIT_AUDIT_COLUMNS,
     TEXT_UNIT_COLUMNS,
     require_columns,
@@ -114,6 +114,9 @@ class MainRegressionPaths:
 
     def stage2_log_path(self, provider: str) -> Path:
         return self.logs_dir / f"05_stage2_processed_{self.year}_{provider}.log"
+
+    def stage2_failure_queue_path(self, provider: str) -> Path:
+        return self.logs_dir / f"05_stage2_failures_{self.year}_{provider}.jsonl"
 
     def ensure_dirs(self) -> None:
         for directory in (self.stage_dir, self.results_dir, self.final_dir, self.logs_dir):
@@ -1314,6 +1317,7 @@ def run_stage1_screening(
     limit: int | None = None,
     keyword_features_csv: Path | None = None,
     raw_failure_log: Path | None = None,
+    resume: bool = True,
 ) -> pd.DataFrame:
     text_units = pd.read_csv(text_units_csv, dtype={"stock_code": str, "year": str, "text_unit_id": str})
     require_columns(text_units, TEXT_UNIT_COLUMNS, str(text_units_csv))
@@ -1321,7 +1325,25 @@ def run_stage1_screening(
         text_units = text_units.head(limit).copy()
 
     order = {str(row["text_unit_id"]): index for index, row in text_units.iterrows()}
-    records: list[dict[str, object]] = []
+    if not resume:
+        output_csv.unlink(missing_ok=True)
+        if raw_failure_log is not None:
+            raw_failure_log.unlink(missing_ok=True)
+    if output_csv.exists():
+        existing = pd.read_csv(output_csv, dtype={"text_unit_id": str})
+        require_columns(existing, STAGE1_RELEVANCE_COLUMNS, str(output_csv))
+        records: list[dict[str, object]] = existing.to_dict("records")
+    else:
+        records = []
+    processed_ids = (
+        {
+            str(record["text_unit_id"])
+            for record in records
+            if str(record.get("stage1_status", "")).upper() != "ERROR"
+        }
+        if resume
+        else set()
+    )
     keyword_ids: set[str] = set()
     if keyword_features_csv is not None and keyword_features_csv.exists():
         keyword_features = pd.read_csv(keyword_features_csv, dtype={"text_unit_id": str})
@@ -1334,13 +1356,18 @@ def run_stage1_screening(
         )
 
     if keyword_ids:
-        for _, row in text_units[text_units["text_unit_id"].astype(str).isin(keyword_ids)].iterrows():
+        for _, row in text_units[
+            text_units["text_unit_id"].astype(str).isin(keyword_ids - processed_ids)
+        ].iterrows():
             records.append(stage1_keyword_skip_result(str(row["text_unit_id"])))
 
-    work_units = text_units[~text_units["text_unit_id"].astype(str).isin(keyword_ids)].copy()
+    processed_ids.update(
+        str(record["text_unit_id"])
+        for record in records
+        if str(record.get("stage1_status", "")).upper() != "ERROR"
+    )
+    work_units = text_units[~text_units["text_unit_id"].astype(str).isin(processed_ids)].copy()
     raw_log_lock = Lock() if raw_failure_log is not None else None
-    if raw_failure_log is not None and raw_failure_log.exists():
-        raw_failure_log.unlink()
 
     if settings.workers <= 1:
         for _, row in tqdm(work_units.iterrows(), total=len(work_units), desc="stage1-screen"):
@@ -1356,6 +1383,8 @@ def run_stage1_screening(
 
     df = pd.DataFrame(records, columns=STAGE1_RELEVANCE_COLUMNS)
     if not df.empty:
+        df = df.drop_duplicates(subset=["text_unit_id"], keep="last")
+        df = df[df["text_unit_id"].astype(str).isin(order)]
         df = df.assign(_order=df["text_unit_id"].map(order)).sort_values("_order").drop(columns="_order")
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     safe_to_csv(df, output_csv)
@@ -1410,7 +1439,7 @@ def run_route_main(
     ].copy()
     if limit is not None:
         routed = routed.head(limit).copy()
-    routed = routed[STAGE2_INPUT_COLUMNS]
+    routed = routed[ROUTE_AUDIT_COLUMNS]
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     safe_to_csv(routed, output_csv)
@@ -1492,6 +1521,7 @@ def write_manifest(
     model_stage1: str,
     model_stage2: str,
     stage1_raw_failure_log_path: Path | None = None,
+    stage2_failure_queue_path: Path | None = None,
 ) -> dict[str, object]:
     keyword_features = safe_read_csv(paths.keyword_features_path, dtype={"text_unit_id": str})
     stage1 = safe_read_csv(paths.stage1_relevance_path, dtype={"text_unit_id": str})
@@ -1536,6 +1566,7 @@ def write_manifest(
             "stage1_raw_failure_log_path": stage1_raw_failure_log_path,
             "stage2_input_path": paths.stage2_input_path,
             "stage2_result_path": paths.stage2_result_path,
+            "stage2_failure_queue_path": stage2_failure_queue_path,
             "mapped_result_path": paths.mapped_result_path,
             "final_output_path": paths.final_output_path,
             "manifest_path": paths.manifest_path,
@@ -1548,6 +1579,7 @@ def write_manifest(
         text_units_path=paths.text_units_path,
         stage2_input_path=paths.stage2_input_path,
         stage2_result_path=paths.stage2_result_path,
+        stage2_failure_queue_path=stage2_failure_queue_path,
         final_output_path=paths.final_output_path,
         required_paths=required_paths,
         extra_counts={

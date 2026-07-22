@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 
 import pandas as pd
 
 from .csv_io import safe_to_csv
+from .extract import reconcile_completed_tasks, successful_stage2_ids, successful_stage2_rows
 from .measurement_manifest import count_rows, parse_bool, safe_read_csv, write_measurement_manifest
 from .schemas import (
     KEYWORD_FEATURE_COLUMNS,
@@ -67,6 +69,10 @@ class RobustnessPaths:
         return self.stage_dir / f"01_{self.unit_slug}_units_{self.year}.csv"
 
     @property
+    def stage1_relevance_path(self) -> Path:
+        return self.stage_dir / f"01_stage1_llm_relevance_{self.year}.csv"
+
+    @property
     def stage2_result_path(self) -> Path:
         return self.results_dir / f"02_stage2_entity_result_{self.year}.csv"
 
@@ -84,6 +90,12 @@ class RobustnessPaths:
 
     def stage2_log_path(self, provider: str) -> Path:
         return self.logs_dir / f"02_stage2_processed_{self.year}_{provider}.log"
+
+    def stage1_raw_failure_log_path(self, provider: str) -> Path:
+        return self.logs_dir / f"01_stage1_raw_failures_{self.year}_{provider}.jsonl"
+
+    def stage2_failure_queue_path(self, provider: str) -> Path:
+        return self.logs_dir / f"02_stage2_failures_{self.year}_{provider}.jsonl"
 
     def ensure_dirs(self) -> None:
         for directory in (self.stage_dir, self.results_dir, self.final_dir, self.logs_dir):
@@ -167,27 +179,6 @@ def _ordered_unique(values: pd.Series) -> list[str]:
     return list(dict.fromkeys(values.astype(str).tolist()))
 
 
-def _completed_stage2_ids(output_csv: Path) -> set[str]:
-    existing = safe_read_csv(output_csv, dtype={"stock_code": str, "year": str, "text_unit_id": str})
-    if existing is None or existing.empty or "text_unit_id" not in existing.columns:
-        return set()
-    return set(existing["text_unit_id"].astype(str))
-
-
-def _sync_stage2_log(log_file: Path, completed_ids: set[str]) -> None:
-    if not completed_ids:
-        return
-    logged_ids: set[str] = set()
-    if log_file.exists():
-        logged_ids = {line.strip() for line in log_file.read_text(encoding="utf-8").splitlines() if line.strip()}
-    missing = sorted(completed_ids - logged_ids)
-    if not missing:
-        return
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    with log_file.open("a", encoding="utf-8") as file:
-        file.write("\n".join(missing) + "\n")
-
-
 def seed_stage2_results_from_existing(
     units_csv: Path,
     source_result_csv: Path,
@@ -198,7 +189,7 @@ def seed_stage2_results_from_existing(
     require_columns(units, TEXT_UNIT_COLUMNS, str(units_csv))
     target_ids = _ordered_unique(units["text_unit_id"])
     target_set = set(target_ids)
-    already_completed = _completed_stage2_ids(output_csv)
+    already_completed = successful_stage2_ids(output_csv)
     if not target_ids and not output_csv.exists():
         output_csv.parent.mkdir(parents=True, exist_ok=True)
         safe_to_csv(pd.DataFrame(columns=TEXT_UNIT_EXTRACTION_COLUMNS), output_csv)
@@ -207,6 +198,7 @@ def seed_stage2_results_from_existing(
     if source_result_csv.exists():
         source = pd.read_csv(source_result_csv, dtype={"stock_code": str, "year": str, "text_unit_id": str})
         require_columns(source, TEXT_UNIT_EXTRACTION_COLUMNS, str(source_result_csv))
+        source = successful_stage2_rows(source)
         reusable = source[
             source["text_unit_id"].astype(str).isin(target_set - already_completed)
         ].copy()
@@ -225,14 +217,9 @@ def seed_stage2_results_from_existing(
                 mode="a",
                 header=header,
             )
-            reusable_ids = _ordered_unique(reusable["text_unit_id"])
-            log_file.parent.mkdir(parents=True, exist_ok=True)
-            with log_file.open("a", encoding="utf-8") as file:
-                file.write("\n".join(reusable_ids) + "\n")
             seeded_rows = int(len(reusable))
 
-    completed_ids = _completed_stage2_ids(output_csv)
-    _sync_stage2_log(log_file, completed_ids & target_set)
+    completed_ids = reconcile_completed_tasks(output_csv, log_file)
     missing_ids = [text_unit_id for text_unit_id in target_ids if text_unit_id not in completed_ids]
     return Stage2SeedReport(
         seeded_rows=seeded_rows,
@@ -241,19 +228,21 @@ def seed_stage2_results_from_existing(
     )
 
 
-def robustness_extra_counts(method: str, paths: RobustnessPaths, main_stage1_path: Path | None = None) -> dict[str, int]:
+def robustness_extra_counts(method: str, paths: RobustnessPaths, stage1_path: Path | None = None) -> dict[str, int]:
     if method == "robustness_keyword":
         return {"N_keyword_candidate": count_rows(paths.units_path, dtype={"text_unit_id": str})}
     if method == "robustness_full_llm":
         return {"N_full_units": count_rows(paths.units_path, dtype={"text_unit_id": str})}
 
-    stage1 = safe_read_csv(main_stage1_path, dtype={"text_unit_id": str}) if main_stage1_path else None
+    stage1 = safe_read_csv(stage1_path, dtype={"text_unit_id": str}) if stage1_path else None
     if stage1 is None or stage1.empty:
-        return {"N_llm_related": 0, "N_llm_uncertain": 0}
+        return {"N_llm_related": 0, "N_llm_uncertain": 0, "N_stage1_failed": 0}
     relevance = stage1.get("relevance", pd.Series(dtype=str)).astype(str).str.lower()
+    status = stage1.get("stage1_status", pd.Series(dtype=str)).astype(str).str.upper()
     return {
         "N_llm_related": int((relevance == "related").sum()),
         "N_llm_uncertain": int((relevance == "uncertain").sum()),
+        "N_stage1_failed": int((status == "ERROR").sum()),
     }
 
 
@@ -269,6 +258,8 @@ def write_robustness_manifest(
     gb_mapping_path: Path,
     model_stage1: str | None,
     model_stage2: str | None,
+    stage1_raw_failure_log_path: Path | None = None,
+    stage2_failure_queue_path: Path | None = None,
 ) -> dict[str, object]:
     required_paths = [
         paths.units_path,
@@ -276,19 +267,23 @@ def write_robustness_manifest(
         paths.mapped_result_path,
         paths.final_output_path,
     ]
-    return write_measurement_manifest(
+    if paths.method == "robustness_llm_only" and source_stage1_relevance_path is not None:
+        required_paths.append(source_stage1_relevance_path)
+    manifest = write_measurement_manifest(
         paths.manifest_path,
         method=paths.method,
         year=paths.year,
         input_paths={
             "source_text_units_path": source_text_units_path,
             "source_keyword_features_path": source_keyword_features_path,
-            "source_stage1_relevance_path": source_stage1_relevance_path,
             "source_stage2_result_path": source_stage2_result_path,
         },
         output_paths={
             "units_path": paths.units_path,
+            "stage1_relevance_path": source_stage1_relevance_path,
+            "stage1_raw_failure_log_path": stage1_raw_failure_log_path,
             "stage2_result_path": paths.stage2_result_path,
+            "stage2_failure_queue_path": stage2_failure_queue_path,
             "mapped_result_path": paths.mapped_result_path,
             "final_output_path": paths.final_output_path,
             "manifest_path": paths.manifest_path,
@@ -301,7 +296,15 @@ def write_robustness_manifest(
         text_units_path=source_text_units_path,
         stage2_input_path=paths.units_path,
         stage2_result_path=paths.stage2_result_path,
+        stage2_failure_queue_path=stage2_failure_queue_path,
         final_output_path=paths.final_output_path,
         required_paths=required_paths,
         extra_counts=robustness_extra_counts(paths.method, paths, source_stage1_relevance_path),
     )
+    if int(manifest.get("N_stage1_failed", 0)):
+        manifest["complete"] = False
+        paths.manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    return manifest

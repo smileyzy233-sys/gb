@@ -37,8 +37,6 @@ from standard_pipeline.main_regression import (
 )
 from standard_pipeline.preprocess import (
     PreprocessSettings,
-    build_keyword_pattern,
-    extract_relevant_text,
     parse_report_filename,
 )
 from standard_pipeline.robustness import (
@@ -47,7 +45,7 @@ from standard_pipeline.robustness import (
     run_prepare_keyword_units,
     run_prepare_llm_units,
 )
-from standard_pipeline.schemas import STAGE1_RELEVANCE_COLUMNS, TEXT_UNIT_EXTRACTION_COLUMNS
+from standard_pipeline.schemas import ROUTE_AUDIT_COLUMNS, STAGE1_RELEVANCE_COLUMNS, TEXT_UNIT_EXTRACTION_COLUMNS
 from standard_pipeline.vllm_batch import (
     VLLMBatchConfig,
     run_stage1_screening_vllm_batch,
@@ -66,17 +64,6 @@ class PreprocessTests(unittest.TestCase):
             parse_report_filename("000001_平安银行_2024_年度报告.txt"),
             {"stock_code": "000001", "year": "2024", "company_name": "平安银行"},
         )
-
-    def test_extract_relevant_text_skips_embedded_ascii_match(self):
-        pattern = build_keyword_pattern(["ISO", "GB/T"])
-        settings = PreprocessSettings(window_pre=10, window_post=10, max_chars=500)
-        with tempfile.TemporaryDirectory() as tmp:
-            report = Path(tmp) / "000001_2024_TEST_report.txt"
-            report.write_text("公司通过ISO 9001认证。这里的DISORDER不应触发ISO。", encoding="utf-8")
-            text = extract_relevant_text(report, pattern, settings)
-        self.assertIn("ISO 9001", text)
-        self.assertNotEqual(text, "未匹配到关键词")
-
 
 class GbMappingTests(unittest.TestCase):
     def test_parse_standard_code(self):
@@ -642,10 +629,8 @@ class MainRegressionTests(unittest.TestCase):
             routed = run_route_main(text_units, keyword, stage1, output)
 
         self.assertEqual(routed["text_unit_id"].tolist(), ["id1", "id2", "id3"])
-        self.assertNotIn("keyword_candidate", routed.columns)
-        self.assertNotIn("matched_terms", routed.columns)
-        self.assertNotIn("relevance", routed.columns)
-        self.assertNotIn("route_reason", routed.columns)
+        self.assertEqual(routed.columns.tolist(), ROUTE_AUDIT_COLUMNS)
+        self.assertEqual(routed["route_reason"].tolist(), ["keyword", "stage1_related", "stage1_uncertain"])
 
     def test_stage1_screening_skips_keyword_candidates(self):
         class CountingClient:
@@ -919,9 +904,10 @@ class MainRegressionTests(unittest.TestCase):
         )
         result = process_text_unit_row(row, EmptyClient(), "prompt", ExtractSettings(max_retries=1, workers=1))
 
-        self.assertEqual(result[0]["entity"], "无")
-        self.assertEqual(result[0]["type"], "TYPE_D")
-        self.assertEqual(result[0]["status"], "NO")
+        self.assertTrue(result.success)
+        self.assertEqual(result.rows[0]["entity"], "无")
+        self.assertEqual(result.rows[0]["type"], "TYPE_D")
+        self.assertEqual(result.rows[0]["status"], "NO")
 
     def test_stage2_vllm_batch_writes_log_and_resumes(self):
         def fake_generate(llm, tokenizer, rows, system_prompt, user_content_builder, config):
@@ -943,6 +929,7 @@ class MainRegressionTests(unittest.TestCase):
             input_csv = tmp_path / "stage2_input.csv"
             output = tmp_path / "stage2_output.csv"
             log_file = tmp_path / "stage2_vllm_batch.log"
+            failure_queue = tmp_path / "stage2_failures.jsonl"
             pd.DataFrame(
                 [
                     {
@@ -974,29 +961,34 @@ class MainRegressionTests(unittest.TestCase):
                         input_csv,
                         output,
                         log_file,
+                        failure_queue,
                         "prompt",
                         VLLMBatchConfig(model_path="model", chunk_size=1),
                         resume=False,
                     )
 
-            with patch("standard_pipeline.vllm_batch.build_vllm_engine") as build_engine:
-                resumed = run_text_unit_extraction_vllm_batch(
-                    input_csv,
-                    output,
-                    log_file,
-                    "prompt",
-                    VLLMBatchConfig(model_path="model", chunk_size=1),
-                    resume=True,
-                )
+            with patch("standard_pipeline.vllm_batch.build_vllm_engine", return_value=(object(), object())):
+                with patch(
+                    "standard_pipeline.vllm_batch.generate_raw_batch",
+                    return_value=['{"standards": []}'],
+                ):
+                    resumed = run_text_unit_extraction_vllm_batch(
+                        input_csv,
+                        output,
+                        log_file,
+                        failure_queue,
+                        "prompt",
+                        VLLMBatchConfig(model_path="model", chunk_size=1),
+                        resume=True,
+                    )
 
             log_lines = log_file.read_text(encoding="utf-8").splitlines()
 
         self.assertEqual(list(result.columns), TEXT_UNIT_EXTRACTION_COLUMNS)
         self.assertEqual(log_lines, ["id1", "id2"])
         self.assertIn("ISO 9001", result["entity"].tolist())
-        self.assertIn("ERROR", result["entity"].tolist())
-        self.assertEqual(len(resumed), len(result))
-        build_engine.assert_not_called()
+        self.assertNotIn("ERROR", result["entity"].tolist())
+        self.assertEqual(set(resumed["text_unit_id"]), {"id1", "id2"})
 
     def test_aggregate_main_dummy_is_max_output(self):
         with tempfile.TemporaryDirectory() as tmp:

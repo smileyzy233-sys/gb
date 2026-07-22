@@ -30,22 +30,49 @@ def count_rows(path: Path | None, dtype: dict[str, object] | None = None) -> int
     return 0 if df is None else int(len(df))
 
 
-def count_stage2_status(stage2_result_path: Path | None) -> tuple[int, int]:
+def is_stage2_failure_sentinel(df: pd.DataFrame) -> pd.Series:
+    if df.empty:
+        return pd.Series(False, index=df.index, dtype=bool)
+    return (
+        df.get("entity", pd.Series("", index=df.index)).astype(str).str.upper().eq("ERROR")
+        | df.get("type", pd.Series("", index=df.index)).astype(str).str.upper().eq("LLM_FAILURE")
+        | df.get("status", pd.Series("", index=df.index)).astype(str).str.upper().eq("FAIL")
+    )
+
+
+def read_failure_queue_ids(failure_queue_path: Path | None) -> set[str]:
+    if failure_queue_path is None or not failure_queue_path.exists():
+        return set()
+    failure_ids: set[str] = set()
+    for line in failure_queue_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        text_unit_id = str(record.get("text_unit_id") or "").strip()
+        if text_unit_id:
+            failure_ids.add(text_unit_id)
+    return failure_ids
+
+
+def count_stage2_status(
+    stage2_result_path: Path | None,
+    failure_queue_path: Path | None = None,
+) -> tuple[int, int]:
     stage2_result = safe_read_csv(
         stage2_result_path,
         dtype={"stock_code": str, "year": str, "text_unit_id": str},
     )
-    if stage2_result is None or stage2_result.empty or "text_unit_id" not in stage2_result.columns:
-        return 0, 0
-
-    failure_mask = (
-        stage2_result.get("entity", pd.Series(dtype=str)).astype(str).eq("ERROR")
-        | stage2_result.get("type", pd.Series(dtype=str)).astype(str).eq("LLM_FAILURE")
-        | stage2_result.get("status", pd.Series(dtype=str)).astype(str).eq("FAIL")
-    )
-    failed_ids = set(stage2_result.loc[failure_mask, "text_unit_id"].astype(str))
-    all_ids = set(stage2_result["text_unit_id"].astype(str))
-    return len(all_ids - failed_ids), len(failed_ids)
+    completed_ids: set[str] = set()
+    sentinel_ids: set[str] = set()
+    if stage2_result is not None and not stage2_result.empty and "text_unit_id" in stage2_result.columns:
+        failure_mask = is_stage2_failure_sentinel(stage2_result)
+        sentinel_ids = set(stage2_result.loc[failure_mask, "text_unit_id"].astype(str))
+        completed_ids = set(stage2_result.loc[~failure_mask, "text_unit_id"].astype(str))
+    failed_ids = (read_failure_queue_ids(failure_queue_path) | sentinel_ids) - completed_ids
+    return len(completed_ids), len(failed_ids)
 
 
 def count_output_1(final_output_path: Path | None) -> int:
@@ -75,15 +102,29 @@ def write_measurement_manifest(
     text_units_path: Path | None,
     stage2_input_path: Path | None,
     stage2_result_path: Path | None,
+    stage2_failure_queue_path: Path | None = None,
     final_output_path: Path | None,
     required_paths: list[Path],
     extra_counts: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     n_text_units = count_rows(text_units_path, dtype={"stock_code": str, "year": str, "text_unit_id": str})
-    n_routed = count_rows(stage2_input_path, dtype={"stock_code": str, "year": str, "text_unit_id": str})
-    n_stage2_completed, n_stage2_failed = count_stage2_status(stage2_result_path)
+    routed = safe_read_csv(stage2_input_path, dtype={"stock_code": str, "year": str, "text_unit_id": str})
+    n_routed = (
+        0
+        if routed is None or routed.empty or "text_unit_id" not in routed.columns
+        else int(routed["text_unit_id"].astype(str).nunique())
+    )
+    n_stage2_completed, n_stage2_failed = count_stage2_status(
+        stage2_result_path,
+        stage2_failure_queue_path,
+    )
+    n_stage2_pending = max(n_routed - n_stage2_completed, 0)
     n_output_1 = count_output_1(final_output_path)
-    complete = all(path.exists() for path in required_paths) and n_stage2_failed == 0
+    complete = (
+        all(path.exists() for path in required_paths)
+        and n_stage2_completed == n_routed
+        and n_stage2_failed == 0
+    )
     created_at = datetime.now(timezone.utc).isoformat()
 
     manifest: dict[str, Any] = {
@@ -101,6 +142,7 @@ def write_measurement_manifest(
         "N_routed_to_stage2": n_routed,
         "N_stage2_completed": n_stage2_completed,
         "N_stage2_failed": n_stage2_failed,
+        "N_stage2_pending": n_stage2_pending,
         "N_output_1": n_output_1,
         "complete": complete,
         "created_at": created_at,

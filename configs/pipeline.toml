@@ -1,16 +1,10 @@
 [paths]
 annual_reports_dir = "年报"
-preprocessed_dir = "预处理数据"
-prediction_dir = "最终预测数据"
 gb_mapping_csv = "GB映射参考数据库/GB_dict.csv"
 keyword_file = "configs/standard_keywords.txt"
 prompt_file = "prompts/extract_standards_zh.txt"
-log_dir = "logs"
 
 [preprocess]
-window_pre = 100
-window_post = 100
-max_chars = 15000
 min_chapter_chars = 500
 target_chapter_keywords = [
   "经营情况",
@@ -24,8 +18,8 @@ target_chapter_keywords = [
 ]
 
 [main_regression]
-text_unit_min_chars = 1000
-text_unit_max_chars = 2400
+text_unit_min_chars = 600
+text_unit_max_chars = 1200
 
 [extract]
 provider = "api"
@@ -65,7 +59,7 @@ gpu_memory_utilization = 0.90
 max_model_len = 4096
 chunk_size = 128
 temperature = 0.0
-max_tokens = 96
+max_tokens = 192
 enforce_eager = false
 enable_lora = false
 lora_path = ""
@@ -106,25 +100,3 @@ enforce_eager = false
 enable_lora = false
 lora_path = ""
 lora_rank = 32
-
-[extract.api]
-api_key_env = "STANDARD_PIPELINE_API_KEY"
-base_url_env = "STANDARD_PIPELINE_BASE_URL"
-model_env = "STANDARD_PIPELINE_MODEL"
-base_url = "http://127.0.0.1:18000/v1"
-model = "qwen3.5-9b"
-temperature = 0.0
-json_response_format = true
-max_tokens = 384
-
-[extract.api.extra_body.chat_template_kwargs]
-enable_thinking = false
-
-# [extract.local]
-# model_path_env = "LOCAL_MODEL_PATH"
-# model_path = "/home/suati/桌面/kernel/model/Qwen3.5-9B"
-# device_map = "auto"
-# torch_dtype = "auto"
-# max_new_tokens = 384
-# max_input_chars = 0
-# load_in_4bit = false

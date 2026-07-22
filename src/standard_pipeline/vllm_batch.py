@@ -12,12 +12,14 @@ from tqdm import tqdm
 
 from .csv_io import safe_to_csv
 from .extract import (
-    append_text_unit_batch,
+    Stage2Outcome,
+    append_stage2_outcomes,
     build_text_unit_user_content,
     extract_json_object,
-    load_processed_tasks,
-    no_result_item,
-    normalize_items,
+    finalize_stage2_output,
+    initialize_stage2_run,
+    stage2_outcome_from_exception,
+    stage2_outcome_from_raw,
     text_unit_task_id,
 )
 from .main_regression import (
@@ -34,7 +36,6 @@ from .schemas import (
     STAGE1_RELEVANCE_COLUMNS,
     STAGE2_INPUT_COLUMNS,
     TEXT_UNIT_COLUMNS,
-    TEXT_UNIT_EXTRACTION_COLUMNS,
     require_columns,
 )
 
@@ -296,7 +297,16 @@ def run_stage1_screening_vllm_batch(
         existing = pd.DataFrame(columns=STAGE1_RELEVANCE_COLUMNS)
         safe_to_csv(existing, output_csv)
 
-    processed_ids = set(existing["text_unit_id"].dropna().astype(str)) if resume else set()
+    processed_ids = (
+        set(
+            existing.loc[
+                existing["stage1_status"].astype(str).str.upper().ne("ERROR"),
+                "text_unit_id",
+            ].dropna().astype(str)
+        )
+        if resume
+        else set()
+    )
 
     def append_checkpoint(records: list[dict[str, object]]) -> None:
         if records:
@@ -367,19 +377,11 @@ def run_stage1_screening_vllm_batch(
     return df
 
 
-def _stage2_failure_item(error: Exception) -> dict[str, str]:
-    return {
-        "entity": "ERROR",
-        "type": "LLM_FAILURE",
-        "status": "FAIL",
-        "evidence": str(error),
-    }
-
-
 def run_text_unit_extraction_vllm_batch(
     input_csv: Path,
     output_csv: Path,
     log_file: Path,
+    failure_queue: Path,
     system_prompt: str,
     config: VLLMBatchConfig,
     resume: bool = True,
@@ -396,89 +398,51 @@ def run_text_unit_extraction_vllm_batch(
     require_columns(df_input, STAGE2_INPUT_COLUMNS, str(input_csv))
     df_input["task_id"] = df_input.apply(text_unit_task_id, axis=1)
 
-    if not resume:
-        if output_csv.exists():
-            output_csv.unlink()
-        if log_file.exists():
-            log_file.unlink()
-
-    processed_tasks = load_processed_tasks(log_file) if resume else set()
+    processed_tasks = initialize_stage2_run(output_csv, log_file, failure_queue, resume)
     df_work = df_input[~df_input["task_id"].isin(processed_tasks)].copy()
     if limit is not None:
         df_work = df_work.head(limit)
 
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-    if not output_csv.exists():
-        safe_to_csv(pd.DataFrame(columns=TEXT_UNIT_EXTRACTION_COLUMNS), output_csv)
-
     if df_work.empty:
-        return pd.read_csv(output_csv, dtype={"stock_code": str, "year": str, "text_unit_id": str})
+        return finalize_stage2_output(output_csv, log_file)
 
     llm, tokenizer = build_vllm_engine(config)
     rows = list(df_work.to_dict("records"))
 
-    rows_buffer: list[dict[str, str]] = []
-    tasks_buffer: list[str] = []
+    outcomes_buffer: list[Stage2Outcome] = []
 
     for start in tqdm(range(0, len(rows), config.chunk_size), desc="stage2-extract"):
         chunk = rows[start : start + config.chunk_size]
 
         with defer_sigint_until_checkpoint() as stop_requested:
-            raw_outputs = generate_raw_batch(
-                llm,
-                tokenizer,
-                chunk,
-                system_prompt,
-                lambda row: build_text_unit_user_content(pd.Series(row)),
-                config,
-            )
-
-            for row, raw in zip(chunk, raw_outputs):
-                text_unit_id = str(row["text_unit_id"])
-                task_id = str(row["task_id"])
-
-                try:
-                    data = extract_json_object(raw)
-                    items = normalize_items(data)
-                    if not items:
-                        items = no_result_item()
-                except Exception as exc:
-                    items = [_stage2_failure_item(exc)]
-
-                for item in items:
-                    rows_buffer.append(
-                        {
-                            "text_unit_id": text_unit_id,
-                            "stock_code": str(row["stock_code"]),
-                            "company_name": str(row["company_name"]),
-                            "year": str(row["year"]),
-                            "entity": item["entity"],
-                            "type": item["type"],
-                            "status": item["status"],
-                            "evidence": item["evidence"],
-                        }
+            try:
+                raw_outputs = generate_raw_batch(
+                    llm,
+                    tokenizer,
+                    chunk,
+                    system_prompt,
+                    lambda row: build_text_unit_user_content(pd.Series(row)),
+                    config,
+                )
+                outcomes_buffer.extend(
+                    stage2_outcome_from_raw(row, raw, provider="vllm_batch")
+                    for row, raw in zip(chunk, raw_outputs)
+                )
+                if len(raw_outputs) < len(chunk):
+                    error = RuntimeError("vLLM returned fewer outputs than inputs")
+                    outcomes_buffer.extend(
+                        stage2_outcome_from_exception(row, error, "vllm_batch")
+                        for row in chunk[len(raw_outputs) :]
                     )
+            except Exception as exc:
+                outcomes_buffer.extend(
+                    stage2_outcome_from_exception(row, exc, "vllm_batch") for row in chunk
+                )
 
-                tasks_buffer.append(task_id)
-
-            append_text_unit_batch(
-                output_csv,
-                log_file,
-                rows_buffer,
-                tasks_buffer,
-            )
-            rows_buffer, tasks_buffer = [], []
+            append_stage2_outcomes(output_csv, log_file, failure_queue, outcomes_buffer)
+            outcomes_buffer = []
         if stop_requested():
             raise KeyboardInterrupt
 
-    append_text_unit_batch(output_csv, log_file, rows_buffer, tasks_buffer)
-    df_final = pd.read_csv(output_csv, dtype={"stock_code": str, "year": str, "text_unit_id": str})
-    if not df_final.empty:
-        sort_key = pd.to_numeric(df_final["stock_code"], errors="coerce")
-        df_final = (
-            df_final.assign(_sort_key=sort_key)
-            .sort_values(["_sort_key", "year", "text_unit_id"])
-            .drop(columns=["_sort_key"])
-        )
-        safe_to_csv(df_final, output_csv)
-    return df_final
+    append_stage2_outcomes(output_csv, log_file, failure_queue, outcomes_buffer)
+    return finalize_stage2_output(output_csv, log_file)

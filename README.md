@@ -1,10 +1,6 @@
 # 国际标准识别流程
 
-这个项目把早期 notebook 流程整理为可复用的国际标准测度流水线。当前包含主回归、三种稳健性检验和跨方法一致性比较；同时保留原有的三段式入口：
-
-1. `preprocess`：从年报 txt 中抽取包含标准、认证、体系关键词的片段。
-2. `extract`：调用 API 或本地模型，将片段抽取为结构化标准实体。
-3. `map-gb`：把 `TYPE_B` 的 GB/行业标准映射到国际标准采标信息，并生成最终 `output` 标记。
+这个项目提供可复用的国际标准测度流水线，包含主回归、三种稳健性检验和跨方法一致性比较。正式推荐入口是 `main-regression`；也可以使用对应的分阶段命令检查或重跑单个阶段。
 
 ## 安装
 
@@ -52,8 +48,6 @@ python scripts/run_pipeline.py --help
 主配置文件在 `configs/pipeline.toml`。默认沿用当前目录下的数据结构：
 
 - 年报原文：`年报/`
-- 预处理输出：`预处理数据/`
-- 最终预测输出：`最终预测数据/`
 - GB 映射库：`GB映射参考数据库/GB_dict.csv`
 - 关键词表：`configs/standard_keywords.txt`
 - 抽取提示词：`prompts/extract_standards_zh.txt`
@@ -129,25 +123,6 @@ python scripts/run_pipeline.py compare-measurements --year 2024
 - `data/measurement/robustness_llm_only/final/04_robustness_llm_only_firm_year_<year>.csv`
 - `data/measurement/robustness_full_llm/final/04_robustness_full_llm_firm_year_<year>.csv`
 
-只做年报预处理：
-
-```powershell
-python scripts/run_pipeline.py preprocess --year 2024
-```
-
-用 API 模型抽取：
-
-```powershell
-python scripts/run_pipeline.py extract --input "预处理数据/yuchuli_2024.csv" --provider api
-```
-
-用本地模型抽取：
-
-```powershell
-$env:LOCAL_MODEL_PATH="A:\models\qwen3.6-27B"
-python scripts/run_pipeline.py extract --input "预处理数据/yuchuli_2024.csv" --provider local
-```
-
 ### provider=vllm_batch
 
 `provider=vllm_batch` 会在当前 pipeline Python 进程中直接加载 `vllm.LLM`，并使用 `llm.generate(prompts, sampling_params)` 对多条 prompt 做批量推理。这个模式不是连接已经启动的 OpenAI-compatible `vllm serve` 服务。
@@ -174,28 +149,24 @@ python scripts/run_pipeline.py stage2-extract --year 2024 --provider vllm_batch
 python scripts/run_pipeline.py main-regression --year 2024 --provider vllm_batch
 ```
 
-执行 GB 映射：
+分阶段执行 GB 映射：
 
 ```powershell
-python scripts/run_pipeline.py map-gb --input "最终预测数据/final_2024.csv"
+python scripts/run_pipeline.py map-main-gb --year 2024
 ```
 
-完整链路：
+完整链路与冒烟测试：
 
 ```powershell
-python scripts/run_pipeline.py run-all --year 2024 --provider api
-```
-
-冒烟测试可以加 `--limit`：
-
-```powershell
-python scripts/run_pipeline.py run-all --year 2024 --provider api --limit 5
+python scripts/run_pipeline.py main-regression --year 2024 --provider api
+python scripts/run_pipeline.py main-regression --year 2024 --provider api --limit 5
 ```
 
 ## 输出字段
 
-`extract` 输出字段：
+`stage2-extract` 输出字段：
 
+- `text_unit_id`
 - `stock_code`
 - `company_name`
 - `year`
@@ -204,7 +175,7 @@ python scripts/run_pipeline.py run-all --year 2024 --provider api --limit 5
 - `status`
 - `evidence`
 
-`map-gb` 在此基础上新增：
+`map-main-gb` 在此基础上新增：
 
 - `国际标准`
 - `采标情况`
