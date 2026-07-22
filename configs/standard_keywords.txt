@@ -1,92 +1,62 @@
 # One keyword per line. Lines starting with # are ignored.
-# International SDOs and standards
+# Optimized for the current single-keyword-file workflow:
+# - keyword hits bypass Stage1 and route directly to Stage2
+# - therefore retain relatively precise standard identifiers and market-access terms
+# - remove certification bodies, broad ESG/reporting frameworks, financial rules,
+#   generic management phrases, and highly ambiguous short abbreviations
+
+# ============================================================
+# A. International, regional, foreign and cross-border standards
+# ============================================================
 ISO
 IEC
+ITU-T
+ITU-R
+ITU-D
 IEEE
-ITU
 ASTM
 ANSI
-CEN
-CENELEC
 ASME
-API Spec
-API认证
-API标准
 SAE
-AEC
-IPC
-JIS
-DIN
-BS
-NEMA
-ASHRAE
 ETSI
 3GPP
-WHO
-FAO
-CODEX
-AISI
-AWS
-NACE
-TAPPI
-AATCC
-OIML
-BIPM
-IAF
-ILAC
-AFNOR
-BSI
-NIST
-WIPO
-WTO-TBT
-JIS Z
-AS/NZS
 JEDEC
-MIPI
-VESA
-PCI-SIG
-USB Implementers Forum
-FIDIC
-AICPA
-IFRS
-GAAP
-COSO
-IAEA
-UN
-ADR
-IMDG
-IATA-DGR
-SEMI
+IPC
+NEMA
+ASHRAE
+API Spec
+API标准
+API认证
+NACE
+OIML
+JIS
+DIN
+EN ISO
+BS EN
+DIN EN
+AS/NZS
 MIL-STD
 MIL-SPEC
-DEF-STAN
-OASIS
 RTCA
 EUROCAE
 ARINC
-FATF
-Basel III
-Solvency II
-OECD Guidelines
-UNGC
-ILO Conventions
-GS1
-EPCglobal
-W3C
-IETF
-O-RAN
-EU AI Act
-PCAOB
-HKFRS
-CSDDD
-UFLPA
-CbCR
-Thread
-Zigbee Alliance
+SEMI
+AEC-Q
+IATF
+IATF 16949
+OHSAS
+OHSAS 18001
+SA8000
+SA 8000
+AS9100
+AS9110
+AS9120
+TL 9000
+Codex Alimentarius
 
-# Chinese national and industry standards
-GB/T
-GB/Z
+# ============================================================
+# B. Chinese national, industry, local and group standards
+# ============================================================
 GB
 GJB
 YY/T
@@ -94,14 +64,9 @@ HG/T
 QB/T
 JB/T
 NB/T
-SL
 DL/T
-HJ
 QC/T
 SN/T
-DB
-T/CAS
-T/
 CJ/T
 JG/T
 SY/T
@@ -109,8 +74,6 @@ TB/T
 MH/T
 JT/T
 GA/T
-GBZ
-GBn
 GH/T
 NY/T
 LY/T
@@ -124,27 +87,16 @@ DZ/T
 EJ/T
 MT/T
 YZ/T
-CNCA
-CNIS
 AQ/T
-AQ
 LS/T
 SB/T
 WB/T
 RB/T
-T/CAAM
-T/CES
-T/CIE
 YB/T
-YB
 SH/T
-SH
 SJ/T
-SJ
 YD/T
-YD
 WS/T
-WS
 JR/T
 DA/T
 CH/T
@@ -152,339 +104,86 @@ GM/T
 CY/T
 TY/T
 LB/T
+T/CAS
+T/CAAM
+T/CES
+T/CIE
 T/CECS
 T/CSAE
 T/CSES
-TC260
 T/CPIA
 T/CNIA
+国家标准
+国家军用标准
+行业标准
+地方标准
+团体标准
 
-# Management systems and market access
-IATF
-VDA
-SA8000
-SA 8000
-BSCI
-RBA
-GMP
-GSP
-CMMI
-ITIL
-PCI-DSS
-TISAX
-ASPICE
-A-SPICE
-SOTIF
-GDPR
-CCPA
-SOC2
-SOC 2
+# ============================================================
+# C. Adoption and international-standard descriptions
+# ============================================================
+国际标准
+国际通行标准
+国际先进标准
+欧盟标准
+区域标准
+国外标准
+境外标准
+采用国际标准
+国际标准转化
+等同采用
+修改采用
+非等效采用
+采标
+
+# ============================================================
+# D. Foreign market access, foreign regulation and conformity
+#    These terms continue to be routed to Stage2 as TYPE_C candidates.
+# ============================================================
+CE认证
+CE标志
+CE marking
+E-Mark
+UKCA
+FDA 510(k)
+510(k)
+FDA批准
+FDA注册
+FDA列名
+FDA授权
+FDA认证
+UL认证
+UL Certified
+REACH
+RoHS
+EU GMP
+FDA cGMP
+WHO GMP
 MDR
 IVDR
-FDA 510(k)
-cGMP
-QSR 820
-MDSAP
-GAP
-GGP
-GLP
-GCP
-GVP
-AS9100
-AS9110
-AS9120
-NADCAP
-IRIS
-TL 9000
-QuEST
-SQF
-GlobalG.A.P.
-BRCGS
-C-TPAT
-TAPA
-AEO
-FIPS
-CC EAL
-OWASP
-ICH
-PIC/S
-Ph. Eur.
-USP
-JP
-CQI-
-HACCP
-FAMI-QS
-GMP+
-ITSS
-DSMM
-PCI 3DS
-PA-DSS
-ARP 4754
-AUTOSAR
-MISRA C
-MISRA C++
-CIS Controls
-GAMP 5
-
-# ESG, environment, safety, and certifications
-RoHS
-REACH
-GRI
-TCFD
-SASB
-CDP
-FSC
-PEFC
-MSC
-BRC
-IFS
-FSSC
-OEKO-TEX
-Bluesign
-WEEE
-EuP
-ErP
-VOCs
-CFCC
-WRAP
-GOTS
-RDS
-RWS
-OCS
-GRS
-EcoVadis
-Sedex
-SMETA
-ICTI
-PAS 2050
-GHG Protocol
-LEED
-BREEAM
-WELL
-GRESB
-EDGE
-ASI
-RMI
-Fairtrade
-SBTi
-ISCC
-RSPO
-RSB
-EPD
-CFP
-LCA
-China RoHS
-Ca Prop 65
-TSCA
-GHS
-SDS
-MSDS
-ZDHC
-Higgs Index
-K-REACH
-UK REACH
-IECEx
 ATEX
-Conflict Minerals
-3TG
-CORSIA
-CCER
-VCS
-IPE
-Green Label
-Eco-Label
-ISSB
-TNFD
-CSRD
-ESRS
-CBAM
-PAS 2060
-EPEAT
-Energy Star
-TCO Certified
-RCS
-Cradle to Cradle
-C2C
-WaterSense
-IECQ
-
-# Certification marks and bodies
-FDA
-CE
-UL
-CSA
-FCC
-BS EN
-DIN EN
-EN ISO
-CCC
-3C
-GS
-E-Mark
-DOT
-OHSAS
-CNAS
-CMA
-UKAS
-SGS
-TUV
-DNV
-BV
-Intertek
-ETL
-NSF
-VDE
-KEMA
-JET
-PSE
-KC
-BIS
-NOM
-INMETRO
-LR
-CCS
-NK
-ABS
-RINA
-KR
-ANAB
-JAB
-DAkkS
-TURKAK
-COFRAC
-RVA
-CQC
-CCAA
-SAC
-CCLC
-Dekra
-Applus
-Eurofins
-Cotecna
-Kiwa
-Bluetooth SIG
-Wi-Fi Alliance
-USB-IF
-LoRa Alliance
-Matter
-Nemko
-Semko
-Fimko
-Demko
-SIRIM
-SNI
-TISI
-BSMI
-NCC
-IC
-RCM
-HDMI
-Qi
-NFC Forum
-Thunderbolt
-DisplayPort
-Z-Wave
-Zigbee
-Thread Group
-DALI
-KNX
-CTIA
-PTCRB
-GCF
-Wi-Fi 6
-Wi-Fi 7
-WPA3
-Dolby
-DTS
-IMQ
-GOST
-EAC
-SABS
-SASO
-Saber
+IECEx
+FCC认证
+FCC批准
+FCC ID
+PSE认证
+KC认证
+EAC认证
+SASO认证
 SONCAP
-IRAM
-FDA cGMP
-CE-MDR
-CE-IVDR
-CFDA
-NMPA
-CCRC
-ISCCC
-BPA Free
-Non-GMO
-Halal
-Kosher
-JCI
-HIMSS
-Uptime Institute
-CTL
+INMETRO
+BIS认证
+NOM认证
+SNI认证
+TISI认证
+SIRIM认证
+BSMI认证
+RCM认证
 CB Scheme
-DoC
-
-# Chinese generic descriptions
-质量管理体系
-环境管理体系
-职业健康
-能源管理
-信息安全管理
-知识产权管理
-社会责任管理
-合规管理体系
-反贿赂管理体系
-业务连续性管理
-测量管理体系
-有害物质过程管理
-森林认证
-主要产品认证
-食品安全管理
-清洁生产审核
-碳足迹认证
-隐私信息管理
-供应链安全管理
-道路交通安全管理
-医疗器械质量管理
-实验室认可
-检验检测机构
-绿色供应链
-有机产品认证
-绿色食品
-无公害农产品
-强制性产品认证
-知识产权贯标
-智能制造能力成熟度
-数据管理能力成熟度
-低碳产品认证
-节能产品认证
-节水产品认证
-环境标志产品
-十环认证
-可信云
-诚信管理体系
-社会信用体系
-内控体系
-双碳管理
-碳排放管理
-温室气体核查
-个人信息保护认证
-App安全认证
-良好农业规范
-良好生产规范
-良好实验室规范
-碳中和工厂
-绿色建筑
-健康建筑
-超低能耗建筑
-能效标识
-水效标识
-数据出境安全
-个人信息出境
-绿色数据中心
-欧盟标准
-国际标准
-推荐性标准
-强制性标准
-采标
-贯标
-白名单资质
-
+境外市场准入
+海外市场准入
+欧盟市场准入
+境外法规
+国外法规
+境外监管批准
+国外监管批准
