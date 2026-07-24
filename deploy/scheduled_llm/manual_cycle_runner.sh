@@ -189,7 +189,7 @@ run_worker() {
       name=$(basename "$dir")
       year=${name%%_*}
       case "$year" in
-        2024|2025) ;;
+        2015|2016|2017|2018|2019|2020|2021|2022|2023|2024|2025) ;;
         *) continue ;;
       esac
 
@@ -319,7 +319,7 @@ run_worker() {
       year=$(basename "$dir")
       year=${year%%_*}
       case "$year" in
-        2024|2025)
+        2015|2016|2017|2018|2019|2020|2021|2022|2023|2024|2025)
           [[ -f "${PROJECT_ROOT}/data/measurement/${year}/main_regression/.pipeline_complete" ]] \
             || still_pending=1
           ;;
@@ -327,7 +327,7 @@ run_worker() {
     done
 
     if (( pending_found == 0 || still_pending == 0 )); then
-      log "All available 2024/2025 work completed; runner is stopping automatically."
+      log "All available 2015-2025 work completed; runner is stopping automatically."
       echo "completed: all available work at $(date '+%F %T')" >"$PHASE_FILE"
       return 0
     fi
