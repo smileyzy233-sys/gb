@@ -17,7 +17,6 @@ from .llm import ChatClient
 from .measurement_manifest import is_stage2_failure_sentinel
 from .schemas import STAGE2_INPUT_COLUMNS, TEXT_UNIT_EXTRACTION_COLUMNS, require_columns
 
-
 VALID_TYPES = {"TYPE_A", "TYPE_B", "TYPE_C", "TYPE_D"}
 VALID_STATUSES = {"ADOPTED", "PENDING", "NO"}
 RAW_RESPONSE_LIMIT = 4000
@@ -253,6 +252,165 @@ def stage2_outcome_from_raw(
                 retries_exhausted=True,
             ),
         )
+
+
+def stage2_outcome_from_raw_safe(
+    row: pd.Series | dict[str, Any],
+    raw: str,
+    *,
+    provider: str = "vllm_batch",
+    attempt: int = 1,
+    structured_output: bool = False,
+    audit_log: Path | None = None,
+    source_text: str | None = None,
+    grounding_mode: str = "off",
+) -> Stage2Outcome:
+    """Safe-recovery variant of ``stage2_outcome_from_raw``.
+
+    Uses strict outer-JSON parsing, optional schema validation, safe repair,
+    and repetition detection.  Audit entries are appended to *audit_log*.
+    """
+    from .stage2_recovery import (
+        SafeRecoveryConfig,
+        append_audit_entries,
+        check_evidence_grounding,
+        detect_stage2_degeneration,
+        extract_stage2_json_object_strict,
+        make_audit_entry,
+        safe_repair_and_parse,
+        validate_stage2_payload,
+    )
+
+    series = row if isinstance(row, pd.Series) else pd.Series(row)
+    text_unit_id = str(series["text_unit_id"])
+    raw_for_log = raw if raw is not None else ""
+
+    def _emit(disposition: str, **overrides: Any) -> dict[str, Any]:
+        base = make_audit_entry(
+            text_unit_id=text_unit_id,
+            attempt=attempt,
+            structured_output=structured_output,
+            parse_method="strict_json",
+            parse_success=False,
+            schema_valid=False,
+            repair_attempted=False,
+            final_disposition=disposition,
+            raw_response=raw_for_log,
+        )
+        base.update(overrides)
+        return base
+
+    # ── Step 1: degeneration detection ──────────────────────────────
+    degen_flags: list[str] = []
+    if raw is not None:
+        degen_flags = detect_stage2_degeneration(raw)
+    if degen_flags:
+        entry = _emit("retry", degeneration_flags=degen_flags)
+        append_audit_entries(audit_log, [entry])
+        return Stage2Outcome(
+            text_unit_id,
+            False,
+            [],
+            stage2_failure_record(
+                series,
+                provider=provider,
+                attempt=attempt,
+                error_type="DegenerationDetected",
+                error=f"Repetition/degeneration: {degen_flags}",
+                raw_response=raw,
+                retries_exhausted=False,
+            ),
+        )
+
+    # ── Step 2: strict JSON parse ───────────────────────────────────
+    parse_success = False
+    schema_valid = False
+    parse_method = "strict_json"
+    repair_actions: list[str] = []
+    repair_attempted = False
+    parse_error: str | None = None
+    original_error_type: str | None = None
+    data: dict[str, Any] | None = None
+
+    try:
+        data = extract_stage2_json_object_strict(raw or "")
+        parse_success = True
+        parse_method = "strict_json"
+    except Exception as exc:
+        original_error_type = type(exc).__name__
+        parse_error = str(exc)
+
+        # ── Step 3: safe repair (one pass) ──────────────────────────
+        try:
+            data, repair_actions = safe_repair_and_parse(raw or "")
+            parse_success = True
+            parse_method = "safe_repair"
+            repair_attempted = True
+        except Exception:
+            data = None
+
+    # ── Step 4: schema validation ───────────────────────────────────
+    if data is not None:
+        validation_errors = validate_stage2_payload(data)
+        schema_valid = len(validation_errors) == 0
+        if not schema_valid:
+            parse_error = (parse_error or "") + f" | Schema errors: {validation_errors}"
+
+    # ── Step 5: outcome ─────────────────────────────────────────────
+    if data is not None and schema_valid:
+        # Evidence grounding audit
+        entity_grounded = None
+        evidence_grounded = None
+        if grounding_mode == "audit" and source_text:
+            items = data.get("standards", [])
+            if items:
+                first_item = items[0]
+                entity_grounded, evidence_grounded = check_evidence_grounding(
+                    str(first_item.get("entity", "")),
+                    str(first_item.get("evidence", "")),
+                    source_text,
+                )
+
+        items = normalize_items(data) or no_result_item()
+        entry = _emit(
+            "success",
+            parse_method=parse_method,
+            parse_success=True,
+            schema_valid=True,
+            repair_attempted=repair_attempted,
+            repair_actions=repair_actions,
+            entity_grounded=entity_grounded,
+            evidence_grounded=evidence_grounded,
+        )
+        append_audit_entries(audit_log, [entry])
+        return Stage2Outcome(text_unit_id, True, _entity_rows(series, items))
+
+    # Failed after all attempts
+    entry = _emit(
+        "retry",
+        parse_method=parse_method,
+        parse_success=parse_success,
+        schema_valid=schema_valid,
+        repair_attempted=repair_attempted,
+        repair_actions=repair_actions,
+        original_error_type=original_error_type,
+        parse_error=parse_error,
+    )
+    append_audit_entries(audit_log, [entry])
+    return Stage2Outcome(
+        text_unit_id,
+        False,
+        [],
+        stage2_failure_record(
+            series,
+            provider=provider,
+            attempt=attempt,
+            error_type=original_error_type or "ParseError",
+            error=parse_error or str(raw)[:200],
+            raw_response=raw,
+            retries_exhausted=False,
+        ),
+    )
 
 
 def stage2_outcome_from_exception(

@@ -535,6 +535,7 @@ def command_stage2_extract(args: argparse.Namespace, config: PipelineConfig) -> 
             config.section("stage2", "vllm_batch"),
             model_path=args.model_path,
         )
+        safe_recovery = config.section("stage2", "safe_recovery")
         df = run_text_unit_extraction_vllm_batch(
             stage2_input,
             output,
@@ -544,6 +545,7 @@ def command_stage2_extract(args: argparse.Namespace, config: PipelineConfig) -> 
             batch_config,
             resume=not args.no_resume,
             limit=args.limit,
+            safe_recovery_config=safe_recovery,
         )
     else:
         client = build_stage_client(

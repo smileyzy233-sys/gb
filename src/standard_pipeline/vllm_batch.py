@@ -13,13 +13,16 @@ from tqdm import tqdm
 from .csv_io import safe_to_csv
 from .extract import (
     Stage2Outcome,
+    append_failure_records,
     append_stage2_outcomes,
     build_text_unit_user_content,
     extract_json_object,
     finalize_stage2_output,
     initialize_stage2_run,
+    stage2_failure_record,
     stage2_outcome_from_exception,
     stage2_outcome_from_raw,
+    stage2_outcome_from_raw_safe,
     text_unit_task_id,
 )
 from .main_regression import (
@@ -140,7 +143,11 @@ def build_vllm_engine(config: VLLMBatchConfig):
     return llm, tokenizer
 
 
-def build_sampling_params(tokenizer, config: VLLMBatchConfig):
+def build_sampling_params(
+    tokenizer,
+    config: VLLMBatchConfig,
+    structured_output_kwargs: dict[str, Any] | None = None,
+):
     try:
         from vllm import SamplingParams
     except ImportError as exc:
@@ -155,11 +162,14 @@ def build_sampling_params(tokenizer, config: VLLMBatchConfig):
         if token_id is not None
     ]
 
-    kwargs = {
+    kwargs: dict[str, Any] = {
         "temperature": config.temperature,
         "max_tokens": config.max_tokens,
         "stop_token_ids": stop_token_ids,
     }
+
+    if structured_output_kwargs:
+        kwargs.update(structured_output_kwargs)
 
     return SamplingParams(**kwargs)
 
@@ -194,8 +204,11 @@ def generate_raw_batch(
     system_prompt: str,
     user_content_builder: Callable[[dict[str, Any]], str],
     config: VLLMBatchConfig,
+    structured_output_kwargs: dict[str, Any] | None = None,
 ) -> list[str]:
-    sampling_params = build_sampling_params(tokenizer, config)
+    sampling_params = build_sampling_params(
+        tokenizer, config, structured_output_kwargs=structured_output_kwargs
+    )
 
     prompts = [
         apply_chat_template(
@@ -377,6 +390,227 @@ def run_stage1_screening_vllm_batch(
     return df
 
 
+def _run_extraction_original(
+    rows: list[dict[str, Any]],
+    output_csv: Path,
+    log_file: Path,
+    failure_queue: Path,
+    system_prompt: str,
+    config: VLLMBatchConfig,
+    llm: Any,
+    tokenizer: Any,
+) -> pd.DataFrame:
+    """Original one-pass extraction (no safe recovery)."""
+    outcomes_buffer: list[Stage2Outcome] = []
+
+    for start in tqdm(range(0, len(rows), config.chunk_size), desc="stage2-extract"):
+        chunk = rows[start : start + config.chunk_size]
+
+        with defer_sigint_until_checkpoint() as stop_requested:
+            try:
+                raw_outputs = generate_raw_batch(
+                    llm, tokenizer, chunk, system_prompt,
+                    lambda row: build_text_unit_user_content(pd.Series(row)),
+                    config,
+                )
+                outcomes_buffer.extend(
+                    stage2_outcome_from_raw(row, raw, provider="vllm_batch")
+                    for row, raw in zip(chunk, raw_outputs)
+                )
+                if len(raw_outputs) < len(chunk):
+                    error = RuntimeError("vLLM returned fewer outputs than inputs")
+                    outcomes_buffer.extend(
+                        stage2_outcome_from_exception(row, error, "vllm_batch")
+                        for row in chunk[len(raw_outputs):]
+                    )
+            except Exception as exc:
+                outcomes_buffer.extend(
+                    stage2_outcome_from_exception(row, exc, "vllm_batch") for row in chunk
+                )
+
+            append_stage2_outcomes(output_csv, log_file, failure_queue, outcomes_buffer)
+            outcomes_buffer = []
+        if stop_requested():
+            raise KeyboardInterrupt
+
+    append_stage2_outcomes(output_csv, log_file, failure_queue, outcomes_buffer)
+    return finalize_stage2_output(output_csv, log_file)
+
+
+def _run_extraction_safe(
+    rows: list[dict[str, Any]],
+    output_csv: Path,
+    log_file: Path,
+    failure_queue: Path,
+    system_prompt: str,
+    config: VLLMBatchConfig,
+    llm: Any,
+    tokenizer: Any,
+    recovery: "SafeRecoveryConfig",
+    audit_log: Path,
+    structured_kwargs: dict[str, Any] | None,
+) -> pd.DataFrame:
+    """Two-pass extraction with safe recovery."""
+    from .stage2_recovery import (  # noqa: F811
+        append_audit_entries,
+        build_retry_user_content,
+        make_audit_entry,
+    )
+
+    outcomes_buffer: list[Stage2Outcome] = []
+    first_pass_failures: list[dict[str, Any]] = []
+    first_pass_failure_ids: set[str] = set()
+
+    # ── First pass ──────────────────────────────────────────────────
+    gen_kwargs = {}
+    if structured_kwargs:
+        gen_kwargs["structured_output_kwargs"] = structured_kwargs
+
+    for start in tqdm(range(0, len(rows), config.chunk_size), desc="stage2-extract"):
+        chunk = rows[start : start + config.chunk_size]
+
+        with defer_sigint_until_checkpoint() as stop_requested:
+            try:
+                raw_outputs = generate_raw_batch(
+                    llm, tokenizer, chunk, system_prompt,
+                    lambda row: build_text_unit_user_content(pd.Series(row)),
+                    config,
+                    **gen_kwargs,
+                )
+            except Exception as exc:
+                for row in chunk:
+                    tid = str(row["text_unit_id"])
+                    outcomes_buffer.append(
+                        stage2_outcome_from_exception(row, exc, "vllm_batch")
+                    )
+                    first_pass_failure_ids.add(tid)
+                append_stage2_outcomes(output_csv, log_file, failure_queue, outcomes_buffer)
+                outcomes_buffer = []
+                if stop_requested():
+                    raise KeyboardInterrupt
+                continue
+
+            if len(raw_outputs) < len(chunk):
+                error = RuntimeError("vLLM returned fewer outputs than inputs")
+                for row in chunk[len(raw_outputs):]:
+                    tid = str(row["text_unit_id"])
+                    outcomes_buffer.append(
+                        stage2_outcome_from_exception(row, error, "vllm_batch")
+                    )
+                    first_pass_failure_ids.add(tid)
+
+            for row, raw in zip(chunk, raw_outputs):
+                outcome = stage2_outcome_from_raw_safe(
+                    row, raw,
+                    provider="vllm_batch",
+                    attempt=1,
+                    structured_output=recovery.structured_output,
+                    audit_log=audit_log,
+                    source_text=str(row.get("text", "")) if recovery.grounding_mode == "audit" else None,
+                    grounding_mode=recovery.grounding_mode,
+                )
+
+                if outcome.success:
+                    outcomes_buffer.append(outcome)
+                else:
+                    first_pass_failures.append(row)
+                    first_pass_failure_ids.add(outcome.text_unit_id)
+
+            append_stage2_outcomes(output_csv, log_file, failure_queue, outcomes_buffer)
+            outcomes_buffer = []
+
+        if stop_requested():
+            raise KeyboardInterrupt
+
+    # ── Second pass (retry first-pass failures only) ────────────────
+    if not first_pass_failures:
+        return finalize_stage2_output(output_csv, log_file)
+
+    for start in tqdm(
+        range(0, len(first_pass_failures), config.chunk_size),
+        desc="stage2-extract-retry",
+    ):
+        retry_chunk = first_pass_failures[start : start + config.chunk_size]
+
+        with defer_sigint_until_checkpoint() as stop_requested:
+            try:
+                raw_outputs = generate_raw_batch(
+                    llm, tokenizer, retry_chunk, system_prompt,
+                    lambda row: build_retry_user_content(
+                        build_text_unit_user_content(pd.Series(row))
+                    ),
+                    config,
+                    **gen_kwargs,
+                )
+            except Exception as exc:
+                for row in retry_chunk:
+                    tid = str(row["text_unit_id"])
+                    rec = stage2_failure_record(
+                        pd.Series(row), provider="vllm_batch", attempt=2,
+                        error_type=type(exc).__name__, error=str(exc),
+                        raw_response=None, retries_exhausted=True,
+                    )
+                    append_failure_records(failure_queue, [rec])
+                if stop_requested():
+                    raise KeyboardInterrupt
+                continue
+
+            if len(raw_outputs) < len(retry_chunk):
+                error = RuntimeError("vLLM returned fewer outputs than inputs (retry)")
+                for row in retry_chunk[len(raw_outputs):]:
+                    tid = str(row["text_unit_id"])
+                    rec = stage2_failure_record(
+                        pd.Series(row), provider="vllm_batch", attempt=2,
+                        error_type=type(error).__name__, error=str(error),
+                        raw_response=None, retries_exhausted=True,
+                    )
+                    append_failure_records(failure_queue, [rec])
+
+            for row, raw in zip(retry_chunk, raw_outputs):
+                outcome = stage2_outcome_from_raw_safe(
+                    row, raw,
+                    provider="vllm_batch",
+                    attempt=2,
+                    structured_output=recovery.structured_output,
+                    audit_log=audit_log,
+                    source_text=str(row.get("text", "")) if recovery.grounding_mode == "audit" else None,
+                    grounding_mode=recovery.grounding_mode,
+                )
+
+                if outcome.success:
+                    success_entry = make_audit_entry(
+                        text_unit_id=outcome.text_unit_id,
+                        attempt=2,
+                        structured_output=recovery.structured_output,
+                        parse_method="structured_retry",
+                        parse_success=True,
+                        schema_valid=True,
+                        repair_attempted=False,
+                        final_disposition="success",
+                        raw_response=raw,
+                    )
+                    append_audit_entries(audit_log, [success_entry])
+                    outcomes_buffer.append(outcome)
+                else:
+                    tid = outcome.text_unit_id
+                    rec = stage2_failure_record(
+                        pd.Series(row), provider="vllm_batch", attempt=2,
+                        error_type=outcome.failure_record.get("error_type", "ParseError") if outcome.failure_record else "ParseError",
+                        error=outcome.failure_record.get("error", str(raw)[:200]) if outcome.failure_record else str(raw)[:200],
+                        raw_response=raw, retries_exhausted=True,
+                    )
+                    append_failure_records(failure_queue, [rec])
+
+            append_stage2_outcomes(output_csv, log_file, failure_queue, outcomes_buffer)
+            outcomes_buffer = []
+
+        if stop_requested():
+            raise KeyboardInterrupt
+
+    append_stage2_outcomes(output_csv, log_file, failure_queue, outcomes_buffer)
+    return finalize_stage2_output(output_csv, log_file)
+
+
 def run_text_unit_extraction_vllm_batch(
     input_csv: Path,
     output_csv: Path,
@@ -386,14 +620,19 @@ def run_text_unit_extraction_vllm_batch(
     config: VLLMBatchConfig,
     resume: bool = True,
     limit: int | None = None,
+    safe_recovery_config: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
+    from .stage2_recovery import (
+        STAGE2_JSON_SCHEMA,
+        build_structured_output_kwargs,
+        safe_recovery_config_from_dict,
+    )
+
+    recovery = safe_recovery_config_from_dict(safe_recovery_config or {})
+
     df_input = pd.read_csv(
         input_csv,
-        dtype={
-            "stock_code": str,
-            "year": str,
-            "text_unit_id": str,
-        },
+        dtype={"stock_code": str, "year": str, "text_unit_id": str},
     )
     require_columns(df_input, STAGE2_INPUT_COLUMNS, str(input_csv))
     df_input["task_id"] = df_input.apply(text_unit_task_id, axis=1)
@@ -409,40 +648,22 @@ def run_text_unit_extraction_vllm_batch(
     llm, tokenizer = build_vllm_engine(config)
     rows = list(df_work.to_dict("records"))
 
-    outcomes_buffer: list[Stage2Outcome] = []
+    if not recovery.enabled:
+        return _run_extraction_original(
+            rows, output_csv, log_file, failure_queue, system_prompt, config, llm, tokenizer,
+        )
 
-    for start in tqdm(range(0, len(rows), config.chunk_size), desc="stage2-extract"):
-        chunk = rows[start : start + config.chunk_size]
+    # ── Safe recovery mode ──────────────────────────────────────────
+    structured_kwargs: dict[str, Any] | None = None
+    if recovery.structured_output:
+        structured_kwargs = build_structured_output_kwargs(STAGE2_JSON_SCHEMA)
 
-        with defer_sigint_until_checkpoint() as stop_requested:
-            try:
-                raw_outputs = generate_raw_batch(
-                    llm,
-                    tokenizer,
-                    chunk,
-                    system_prompt,
-                    lambda row: build_text_unit_user_content(pd.Series(row)),
-                    config,
-                )
-                outcomes_buffer.extend(
-                    stage2_outcome_from_raw(row, raw, provider="vllm_batch")
-                    for row, raw in zip(chunk, raw_outputs)
-                )
-                if len(raw_outputs) < len(chunk):
-                    error = RuntimeError("vLLM returned fewer outputs than inputs")
-                    outcomes_buffer.extend(
-                        stage2_outcome_from_exception(row, error, "vllm_batch")
-                        for row in chunk[len(raw_outputs) :]
-                    )
-            except Exception as exc:
-                outcomes_buffer.extend(
-                    stage2_outcome_from_exception(row, exc, "vllm_batch") for row in chunk
-                )
+    audit_log = (
+        failure_queue.parent
+        / f"05_stage2_recovery_audit_{Path(input_csv).stem.split('_')[-1]}_vllm_batch.jsonl"
+    )
 
-            append_stage2_outcomes(output_csv, log_file, failure_queue, outcomes_buffer)
-            outcomes_buffer = []
-        if stop_requested():
-            raise KeyboardInterrupt
-
-    append_stage2_outcomes(output_csv, log_file, failure_queue, outcomes_buffer)
-    return finalize_stage2_output(output_csv, log_file)
+    return _run_extraction_safe(
+        rows, output_csv, log_file, failure_queue, system_prompt, config,
+        llm, tokenizer, recovery, audit_log, structured_kwargs,
+    )
